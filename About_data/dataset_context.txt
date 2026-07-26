@@ -1,0 +1,49 @@
+# LLM Context: Multi-Region MRI-CT Dataset & Preprocessing Pipeline
+
+## Overview
+You are assisting with a medical deep learning project (e.g., Pix2Pix / CycleGAN) focused on synthesizing CT images from MRI scans. 
+This dataset consists of 45 patients with paired MRI and CT scans. 
+
+CRITICAL CONTEXT: Unlike standard medical datasets that focus on a single anatomy (e.g., only brains or only knees), **this dataset is highly heterogeneous and spans 10 different body regions.** Any deep learning architecture, data augmentation strategy, or loss function you propose MUST account for this massive anatomical variance.
+
+## Dataset Breakdown & Regions
+Total Patients: 45
+* **Brain (15 patients):** PA0, PA1, PA4, PA5, PA10, PA17, PA19, PA21, PA24, PA26, PA28, PA33, PA34, PA38, PA44
+* **Abdomen / Pelvis / Torso / Chest / Fistulagram (16 patients):** PA2, PA8, PA9, PA12, PA15, PA20, PA22, PA25, PA27, PA29, PA30, PA35, PA37, PA39, PA41, PA42
+* **Musculoskeletal (Knee / Ankle / Shoulder) (10 patients):** PA3, PA6, PA11, PA13, PA14, PA16, PA32, PA36, PA40, PA43
+* **Spine (4 patients):** PA7, PA18, PA23, PA31
+
+## Data Anomalies & Special Cases (DO NOT IGNORE)
+1. **PA15 & PA16:** These two IDs actually belong to the exact same patient (Suman Lata) scanned in two different regions (Pelvis/Hip and Knee, respectively). 
+2. **PA32 (Mandbi):** Contains 6 MRI series and 6 CT series because it covers TWO body regions (Knee and Ankle) in all 3 orientations (Axial, Coronal, Sagittal). When processing, PA32 must be treated as two distinct patient datasets (e.g., PA32_Knee and PA32_Ankle) to avoid the script mismatching a Knee CT with an Ankle MRI.
+3. **Missing Modalities:** Some patients (like PA23, PA24, PA26, PA27, PA44) only have data for a single orientation. 
+4. **MRI Weighting:** The dataset is a mix of T1-weighted and T2-weighted sequences. 
+
+## Existing Preprocessing Pipeline
+The raw DICOMs have already been processed through a custom Python pipeline into 2D paired `.npy` float32 arrays (scaled to [0, 1]). Do NOT suggest re-running classical DICOM processing unless modifying the existing pipeline.
+
+**Pipeline Structure & Documentation:**
+The pipeline was recently refactored into a highly modular architecture (`preprocess_2d.py`, `pipeline_core.py`, `image_processing.py`, `normalization.py`, `export_utils.py`, `io_utils.py`). Every mathematical function is exhaustively documented inline and tagged chronologically (e.g., `[Function 1]`, `[Function 2]`) tracking its execution from the main loop. 
+
+**Here is what the pipeline already does:**
+1. **Series Pairing:** CT and MRI series are matched by strict folder-name prefix (e.g., CT series `SE0_1` pairs with MRI series `SE0` because both start with `SE0`). A helper function that instead picks the series with the most slices per orientation (`select_best_series` in `io_utils.py`) exists but is currently unused/dead code — it is NOT part of the live pairing path.
+2. **N4 Bias Field Correction:** Applied to MRI only. Done in **2D slice-by-slice mode** rather than 3D, because the data is highly anisotropic (thick slice gaps like 4mm) and doing it in 3D crashes the B-spline grid fitting on patients with very few slices (e.g., 18 slices).
+3. **Resampling:** Both CT and MRI are resampled in-plane to exactly **1.0 mm/px**. Slice thickness (Z-axis) is intentionally left untouched to prevent interpolation artifacts.
+4. **2D Rigid Registration (Optional):** If the `--register_2d` flag is used, it applies Gradient Descent with Mattes Mutual Information to shift/rotate the MRI slice to align perfectly with the CT slice.
+5. **Region-Aware Intensity Normalization:**
+   * **MRI:** Clipped to [0.5, 99.5] percentiles computed across the whole 3D volume, then scaled to [0, 1].
+   * **CT:** Scaled to [0, 1] using dynamic Hounsfield Unit (HU) windows based on the patient's body region to maximize soft-tissue contrast:
+     - Brain: [0, 80] HU
+     - Abdomen/Chest: [-160, 240] HU
+     - MSK (Knees/Joints): [-200, 300] HU
+5. **Background Filtering:** Any 2D slice pair where >90% of the pixels have a normalized intensity < 0.02 is discarded.
+6. **Region-Aware Cropping:**
+   * Brain & MSK: Center cropped/padded to 256x256 pixels.
+   * Abdomen/Chest: Center cropped/padded to 384x384 pixels (to prevent cutting off large torso anatomy).
+7. **Outputs:** Saves `.npy` arrays, PNG previews, and a `metadata.csv` tracking `patient_id, body_region, orientation, slice_index`.
+
+## How to Help the User
+When the user asks for deep learning models (like GANs), data augmentation, or training loops:
+* Advise them to use the `body_region` tag in `metadata.csv` to heavily stratify their train/test splits.
+* Warn them about running random horizontal flips on Abdomen scans (as it flips asymmetrical organs like the liver/spleen), whereas it is fine for Brains and Knees.
+* Suggest condition-based GAN architectures (feeding the region/modality as a one-hot encoded vector) or training completely separate models per region.
