@@ -1,6 +1,8 @@
 # 📖 Learn the Code: `pipeline_config.py`
 
-This file is the **Configuration Hub** of your entire preprocessing pipeline. By centralizing all the hard-coded variables (like image sizes, Hounsfield windows, and folder paths) into one dictionary, you can easily tweak the pipeline without ever having to touch the complex logic inside the other scripts.
+This file is the **Configuration Hub** of your entire preprocessing pipeline. By centralizing all the hard-coded variables (like Hounsfield windows and folder paths) into one dictionary, you can easily tweak the pipeline without ever having to touch the complex logic inside the other scripts.
+
+> **Note:** there is no output image size setting. The pipeline does not crop, pad, or resize — the GAN's dataloader owns that decision. See [`ct_pipeline_docs.md`](./ct_pipeline_docs.md) §10.
 
 ---
 
@@ -34,14 +36,12 @@ CT scanners output standard **Hounsfield Units (HU)**.
 
 ## 🧠 Region Profiles (`REGION_PROFILES`)
 
-Not all body parts are the same size, nor do they require the same visual contrast. This dictionary allows the pipeline to intelligently adapt its parameters depending on the patient's body part!
+Different body parts require different visual contrast. This dictionary allows the pipeline to intelligently adapt its CT windowing depending on the patient's body part!
 
 ### How it works:
 When the pipeline runs, it checks which region the patient belongs to, and loads these custom parameters:
 
-1. **`target_size`**: The output pixel dimensions (e.g., `256` means `256x256`).
-   - *Example:* Brains are small and fit in `256x256`. Abdomens are large and need `384x384`.
-2. **`ct_win_min` & `ct_win_max`**: The Hounsfield Unit bounds.
+1. **`ct_win_min` & `ct_win_max`**: The Hounsfield Unit bounds.
    - *Example (Brain):* `[0, 80]` - Focuses intensely on gray/white matter, making the dense skull turn pure white and ignored by the AI.
    - *Example (Spine/Knee):* `[-200, 300]` - Focuses on muscles, ligaments, and fluid.
    

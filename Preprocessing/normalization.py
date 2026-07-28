@@ -63,44 +63,6 @@ def normalize_mri_slice(slice_2d, p1, p99):
     return (s - p1) / denom
 
 
-def center_crop_pad(arr, target=256):
-    """
-    [Function 11: Called via pipeline_core.py:147, originating from main script preprocess_2d.py:262]
-    Resize a 2-D array to (target x target) by symmetrically cropping if
-    larger, or zero-padding if smaller.
-    """
-    # Extract the current height (h) and width (w) of the image array.
-    h, w = arr.shape
-
-    # Calculate how much padding is needed. If the target is 256 but height is 200, we need 56 pixels of padding.
-    # The max(0, ...) ensures we don't calculate negative padding if the image is already bigger than the target.
-    ph = max(0, target - h)
-    pw = max(0, target - w)
-    
-    # If the image is smaller than the target in either dimension...
-    if ph > 0 or pw > 0:
-        # Pad the array with black pixels (constant_values=0.0).
-        # We divide the padding by 2 (e.g. ph // 2) so half the padding goes on top, and the other half goes on bottom.
-        # This is important to ensure the anatomical structure remains perfectly centered in the new image.
-        arr = np.pad(arr,
-                     ((ph // 2, ph - ph // 2),
-                      (pw // 2, pw - pw // 2)),
-                     mode="constant",
-                     constant_values=0.0)
-
-    # Re-calculate the height and width, because if we added padding, the array is now larger.
-    h, w = arr.shape
-    
-    # Calculate how many pixels we need to shave off the top and left edges to get exactly to the target size.
-    # By dividing by 2, we find the exact center coordinate of the image.
-    sh = (h - target) // 2
-    sw = (w - target) // 2
-    
-    # Crop the array starting from the center offset (sh, sw) and ending exactly at the target width/height.
-    # This guarantees the output is always a perfect (target x target) square, which neural networks require.
-    return arr[sh : sh + target, sw : sw + target]
-
-
 def is_background_slice(arr, intensity_thresh=0.02, bg_fraction=0.90):
     """
     [Function 10: Called via pipeline_core.py:140, originating from main script preprocess_2d.py:262]

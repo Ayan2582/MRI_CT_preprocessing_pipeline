@@ -21,9 +21,10 @@ ORIENTATIONS = ["axial", "coronal", "sagittal"]
 TARGET_SPACING_MM = 1.0
 
 # ── Output image size ─────────────────────────────────────────────────────────
-# Slices are center-cropped or zero-padded to a square of this side length (px).
-# At 1.0 mm/px, 256 px covers a 256 mm FOV — sufficient for joint anatomy.
-TARGET_SIZE_PX = 256
+# There is none. This pipeline does not crop, pad, or resize — slices are saved at
+# their native post-resample size, and the GAN's dataloader owns the crop decision.
+# See Preprocessing/docs/ct_pipeline_docs.md §10 for the per-region sizes that were
+# previously used (256 px for brain/MSK/spine, 384 px for abdomen) and why.
 
 # ── CT intensity windowing ────────────────────────────────────────────────────
 # Pixels are clipped to [WIN_MIN, WIN_MAX] HU, then normalised to [0.0, 1.0].
@@ -50,27 +51,22 @@ SKIP_EXISTING = True   # skip patients whose output folder already exists
 # ── Multi-Region Configurations ───────────────────────────────────────────────
 REGION_PROFILES = {
     "brain": {
-        "target_size": 256,
         "ct_win_min": 0.0,
         "ct_win_max": 80.0
     },
     "abdomen": {
-        "target_size": 384,
         "ct_win_min": -160.0,
         "ct_win_max": 240.0
     },
     "musculoskeletal": {
-        "target_size": 256,
         "ct_win_min": -200.0,
         "ct_win_max": 300.0
     },
     "spine": {
-        "target_size": 256,
         "ct_win_min": -200.0,
         "ct_win_max": 300.0
     },
     "default": {
-        "target_size": 256,
         "ct_win_min": -200.0,
         "ct_win_max": 300.0
     }

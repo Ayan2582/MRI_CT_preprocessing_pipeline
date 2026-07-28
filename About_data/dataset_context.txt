@@ -26,7 +26,7 @@ The raw DICOMs have already been processed through a custom Python pipeline into
 The pipeline was recently refactored into a highly modular architecture (`preprocess_2d.py`, `pipeline_core.py`, `image_processing.py`, `normalization.py`, `export_utils.py`, `io_utils.py`). Every mathematical function is exhaustively documented inline and tagged chronologically (e.g., `[Function 1]`, `[Function 2]`) tracking its execution from the main loop. 
 
 **Here is what the pipeline already does:**
-1. **Series Pairing:** CT and MRI series are matched by strict folder-name prefix (e.g., CT series `SE0_1` pairs with MRI series `SE0` because both start with `SE0`). A helper function that instead picks the series with the most slices per orientation (`select_best_series` in `io_utils.py`) exists but is currently unused/dead code — it is NOT part of the live pairing path.
+1. **Series Pairing:** CT and MRI series are matched by strict folder-name prefix (e.g., CT series `SE0_1` pairs with MRI series `SE0` because both start with `SE0`). This is the only pairing path; unused helper functions that would have selected series by slice count or orientation have been removed from `io_utils.py`.
 2. **N4 Bias Field Correction:** Applied to MRI only. Done in **2D slice-by-slice mode** rather than 3D, because the data is highly anisotropic (thick slice gaps like 4mm) and doing it in 3D crashes the B-spline grid fitting on patients with very few slices (e.g., 18 slices).
 3. **Resampling:** Both CT and MRI are resampled in-plane to exactly **1.0 mm/px**. Slice thickness (Z-axis) is intentionally left untouched to prevent interpolation artifacts.
 4. **2D Rigid Registration (Optional):** If the `--register_2d` flag is used, it applies Gradient Descent with Mattes Mutual Information to shift/rotate the MRI slice to align perfectly with the CT slice.
@@ -37,10 +37,8 @@ The pipeline was recently refactored into a highly modular architecture (`prepro
      - Abdomen/Chest: [-160, 240] HU
      - MSK (Knees/Joints): [-200, 300] HU
 5. **Background Filtering:** Any 2D slice pair where >90% of the pixels have a normalized intensity < 0.02 is discarded.
-6. **Region-Aware Cropping:**
-   * Brain & MSK: Center cropped/padded to 256x256 pixels.
-   * Abdomen/Chest: Center cropped/padded to 384x384 pixels (to prevent cutting off large torso anatomy).
-7. **Outputs:** Saves `.npy` arrays, PNG previews, and a `metadata.csv` tracking `patient_id, body_region, orientation, slice_index`.
+6. **NO Cropping:** The pipeline does NOT crop, pad, or resize. Slices are saved at their native post-resample size, which **varies per series**, so `torch.stack` will fail on a naive batch. Cropping is deliberately deferred to the GAN's dataloader so crop strategy and input resolution can change without re-running preprocessing. The CT and MRI of a pair always share the same shape — apply one crop offset to both, or their pixel-level alignment is destroyed. (Historically the pipeline center-cropped to 256x256 for brain/MSK/spine and 384x384 for abdomen; those remain sensible starting values, keyed off the `body_region` column.)
+7. **Outputs:** Saves `.npy` arrays, PNG previews, and a `metadata.csv` tracking `patient_id, body_region, orientation, slice_index, ct_series, mri_series, mri_desc, height, width, ct_npy, mri_npy`. Use `height`/`width` to plan batching and filter out slices smaller than your crop target without opening every array.
 
 ## How to Help the User
 When the user asks for deep learning models (like GANs), data augmentation, or training loops:

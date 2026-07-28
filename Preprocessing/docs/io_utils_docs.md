@@ -7,33 +7,9 @@ This module is exclusively responsible for discovering, reading, and loading raw
 ```python
 import os # Used to navigate folders and join paths.
 import logging # Used for safe console printing.
-import numpy as np # Used for matrix math.
 import SimpleITK as sitk # Standard toolkit for reading DICOM medical images.
 
 logger = logging.getLogger(__name__)
-
-def get_orientation_from_direction(direction):
-    """
-    [Unused Helper Function]
-    Derive the slice-plane orientation from a SimpleITK direction cosine matrix.
-    """
-    # The direction array is a flat list of 9 numbers. We reshape it into a 3x3 matrix.
-    # This matrix mathematically describes how the MRI is tilted in physical 3D space.
-    d = np.array(direction).reshape(3, 3)
-    
-    # We only care about the 3rd row (index 2), which represents the "normal" vector.
-    # The normal vector is an imaginary arrow pointing straight out of the slice.
-    # We take the absolute value because we don't care if it's pointing forward or backward.
-    normal = np.abs(d[2, :])
-    
-    # We find which axis (X=0, Y=1, or Z=2) the arrow is pointing down the hardest.
-    idx = int(np.argmax(normal))
-    
-    # If it points down X, it's a Sagittal slice (ear-to-ear).
-    # If it points down Y, it's a Coronal slice (face-to-back).
-    # If it points down Z, it's an Axial slice (head-to-toe).
-    return {0: "sagittal", 1: "coronal", 2: "axial"}.get(idx, "unknown")
-
 
 def get_orientation_from_desc(description):
     """
@@ -159,29 +135,18 @@ def discover_series(study_path):
 
     return series_list
 
-
-def select_best_series(series_list, orientation):
-    """
-    [Unused Helper Function]
-    From a list of series dicts, return the single best candidate for the
-    requested orientation.
-    """
-    # Filter the list so we only have scans matching the orientation we want.
-    candidates = [s for s in series_list if s["orientation"] == orientation]
-    if not candidates:
-        return None
-        
-    # If the patient had multiple axial scans (e.g. one with contrast, one without),
-    # we automatically pick the one with the most slices, as it gives the AI more data!
-    return max(candidates, key=lambda s: s["n_slices"])
-
-
-def get_all_valid_series(series_list, orientation):
-    """
-    [Unused Helper Function]
-    Return all series that match the requested orientation.
-    """
-    # A simple Python list comprehension to filter the list.
-    return [s for s in series_list if s["orientation"] == orientation]
-
 ```
+
+---
+
+## Removed helpers
+
+Three unused functions were deleted from this module. None were ever wired into the live pipeline; they are recoverable from git history if needed.
+
+| Function | What it did | Why it went |
+|---|---|---|
+| `get_orientation_from_direction()` | Derived the slice plane from the DICOM direction-cosine matrix — the geometrically correct method. | Never called. Orientation is resolved from folder names and series descriptions instead (see `discover_series` above). Worth reviving if string-based detection proves unreliable. |
+| `select_best_series()` | Picked the series with the most slices for a given orientation. | Never called. Pairing is by strict folder-name prefix; when several CT series share a base token the sorted-first one wins. |
+| `get_all_valid_series()` | Filtered a series list by orientation. | Never called. A one-line list comprehension. |
+
+Removing `get_orientation_from_direction()` also dropped this module's `numpy` dependency.

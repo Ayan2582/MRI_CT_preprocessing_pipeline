@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     
-    # Expose the configuration variables so the user can change them via the terminal (e.g., --target_size 128).
+    # Expose the configuration variables so the user can change them via the terminal (e.g., --target_spacing 2.0).
     # This makes the script highly reusable without having to manually edit the Python code.
     p.add_argument("--data_root",      default=cfg.DATA_ROOT,
                    help="Root DICOM directory with CT/ and MRI/ sub-folders")
@@ -68,8 +68,6 @@ def parse_args() -> argparse.Namespace:
                    help="Where to write processed slices")
     p.add_argument("--target_spacing", type=float, default=cfg.TARGET_SPACING_MM,
                    help="In-plane target voxel spacing in mm")
-    p.add_argument("--target_size",    type=int,   default=cfg.TARGET_SIZE_PX,
-                   help="Output image side length in pixels (square)")
     p.add_argument("--ct_win_min",     type=float, default=cfg.CT_WINDOW_MIN_HU,
                    help="CT window lower bound (HU)")
     p.add_argument("--ct_win_max",     type=float, default=cfg.CT_WINDOW_MAX_HU,
@@ -115,7 +113,7 @@ def main():
     log.info(f"  Output dir      : {args.output_dir}")
     log.info(f"  Orientations    : {cfg.ORIENTATIONS}")
     log.info(f"  Target spacing  : {args.target_spacing} mm")
-    log.info(f"  Target size     : {args.target_size} x {args.target_size} px")
+    log.info(f"  Cropping        : DISABLED - slices saved at native size, cropped at load time")
     log.info(f"  CT window       : [{args.ct_win_min}, {args.ct_win_max}] HU -> [0, 1]")
     log.info(f"  MRI percentiles : [{args.mri_p_low}, {args.mri_p_high}]  -> [0, 1]")
     log.info(f"  BG filter       : thresh={args.bg_thresh}, fraction={args.bg_fraction}")
@@ -172,13 +170,11 @@ def main():
         profile = cfg.REGION_PROFILES.get(region, cfg.REGION_PROFILES["default"])
         
         # Temporarily overwrite the global pipeline arguments with this specific region's settings!
-        # This allows the pipeline to dynamically adjust its AI crop size and CT Window per-patient!
-        args.target_size = profile["target_size"]
+        # This allows the pipeline to dynamically adjust its CT Window per-patient.
         args.ct_win_min = profile["ct_win_min"]
         args.ct_win_max = profile["ct_win_max"]
-        
+
         log.info(f"  Region          : {region.upper()}")
-        log.info(f"  Target size     : {args.target_size} x {args.target_size} px")
         log.info(f"  CT window       : [{args.ct_win_min}, {args.ct_win_max}] HU")
 
         # Construct the path to the patient's actual DICOM scans (ST0 folder).
@@ -282,6 +278,7 @@ def main():
     fieldnames = [
         "patient_id", "body_region", "orientation", "slice_index",
         "ct_series", "mri_series", "mri_desc",
+        "height", "width",
         "ct_npy", "mri_npy",
     ]
     with open(meta_path, "w", newline="", encoding="utf-8") as f:

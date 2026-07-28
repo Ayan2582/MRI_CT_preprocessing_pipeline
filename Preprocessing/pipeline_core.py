@@ -42,7 +42,7 @@ def process_orientation_pair(
        Example: "C:/Outputs/PA0_Ranjeet"
        
     4. args: The parsed terminal commands (argparse.Namespace).
-       Contains dynamic settings like args.target_size (e.g. 256) and args.ct_win_min.
+       Contains dynamic settings like args.ct_win_min and args.ct_win_max.
        
     5. log: The logging.Logger object used to print messages to the console safely.
        
@@ -114,7 +114,7 @@ def process_orientation_pair(
         f"p{args.mri_p_low}={p1:.1f}  p{args.mri_p_high}={p99:.1f}"
     )
 
-    # -- Steps 5-8: Normalise / filter / crop / save --
+    # -- Steps 5-8: Normalise / filter / save --  (cropping now happens at dataloader time)
     n_saved      = 0
     n_skipped_bg = 0
 
@@ -142,10 +142,12 @@ def process_orientation_pair(
             n_skipped_bg += 1
             continue
 
-        # Crop / pad: Force the arrays to become perfect, uniform squares (e.g., 256x256).
-        # [Function Origin: normalization.py]
-        ct_final  = norm.center_crop_pad(ct_norm,  args.target_size)
-        mri_final = norm.center_crop_pad(mri_norm, args.target_size)
+        # NOTE: No cropping / padding happens here anymore.
+        # Slices are saved at their native post-resample size, which varies per series.
+        # Cropping is deferred to the GAN's dataloader so that crop strategy (center,
+        # random, body-mask) can be changed and re-tuned without re-running this pipeline.
+        ct_final  = ct_norm
+        mri_final = mri_norm
 
         # Save .npy
         # Extract the human-readable folder name (e.g. "SE0").
@@ -178,6 +180,11 @@ def process_orientation_pair(
 
         # Append all the paths and clinical info to a dictionary so the orchestrator can write it into a giant CSV file.
         # Deep Learning Dataloaders (like in PyTorch) use these CSV files to find the images on the hard drive during training!
+        # Because slices are no longer cropped to a uniform square, the dataloader cannot
+        # assume a shape. We record the actual saved dimensions so the Dataset can size
+        # batches and filter undersized slices without opening every .npy file first.
+        h, w = ct_final.shape
+
         metadata_rows.append({
             "patient_id":    patient_id,
             "body_region":   region,
@@ -186,6 +193,8 @@ def process_orientation_pair(
             "ct_series":     os.path.basename(ct_entry["path"]),
             "mri_series":    os.path.basename(mri_entry["path"]),
             "mri_desc":      mri_entry["series_desc"],
+            "height":        h,
+            "width":         w,
             "ct_npy":        ct_path,
             "mri_npy":       mri_path,
         })
