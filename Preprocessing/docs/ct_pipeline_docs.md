@@ -215,21 +215,23 @@ Unlike the MRI path there is no divide-by-zero guard — none is needed, since `
 
 ---
 
-## 9. Stage 8 — Background Rejection
+## 9. Stage 8 — Background Flagging
 
-**Code:** `normalization.is_background_slice()` · `pipeline_core.py:140–143`
+**Code:** `normalization.is_background_slice()` · `pipeline_core.py:144–149`
 
 ```python
 np.mean(arr <= 0.02) > 0.90
 ```
 
-A slice is discarded if **more than 90 % of its pixels fall below normalised intensity 0.02**. Checked on the CT and the MRI, joined with `or` — **if either side is background, the pair is dropped**, preserving the 1:1 pairing invariant.
+A slice is flagged if **more than 90 % of its pixels fall below normalised intensity 0.02**. Checked on the CT and the MRI, joined with `or` — **if either side is background, the pair is flagged**.
+
+> ⚙️ **Flagged, not dropped.** Earlier versions of this pipeline discarded these pairs outright. That risked silently losing genuine anatomy: a slice near the FOV edge can still contain a thin sliver of real tissue, and a fixed 90 % threshold has no way to tell "empty air slice" from "mostly-background slice with a sliver of anatomy at the margin." Every slice is now saved, and the pair is tagged `is_background=True` in `metadata.csv` instead. Filtering — if any — is deferred to the GAN's dataloader, where it's a reversible dataset-level choice instead of an irreversible decision baked into the `.npy` files.
 
 > ⚠️ **Window-dependent behaviour on CT.** The threshold is applied *after* normalisation, so what counts as "background" shifts with the region profile:
 > * Brain `[0, 80]`: air (−1000 HU) and fat (−100 HU) both clip to `0.0`, so the effective cutoff is "≤ 1.6 HU". Very aggressive — anything at or below water density reads as background.
 > * MSK `[-200, 300]`: `0.02` maps back to −190 HU. Only true air is rejected; fat and lung parenchyma survive.
 >
-> This means the same anatomical slice could be kept under one profile and dropped under another. Tune with `--bg_thresh` / `--bg_fraction` if a region is losing too many usable slices — the per-orientation log line reports exactly how many were discarded.
+> This means the same anatomical slice could be flagged under one profile and not under another. Tune with `--bg_thresh` / `--bg_fraction` if a region's flag rate looks off — the per-orientation log line reports exactly how many were flagged.
 
 ---
 

@@ -255,17 +255,17 @@ The same `p1`/`p99` are reused for **every slice in the series**, which is what 
 
 ---
 
-## 11. Stage 10 — Background Rejection
+## 11. Stage 10 — Background Flagging
 
-**Code:** `normalization.is_background_slice()` · `pipeline_core.py:140–143`
+**Code:** `normalization.is_background_slice()` · `pipeline_core.py:144–149`
 
 ```python
 np.mean(arr <= 0.02) > 0.90
 ```
 
-A slice is discarded if **more than 90 % of its pixels sit below normalised intensity 0.02**.
+A slice is flagged if **more than 90 % of its pixels sit below normalised intensity 0.02**.
 
-The check is applied to the CT **and** the MRI, joined with `or` — **if either side is background, the pair is dropped.** This preserves the 1:1 pairing invariant that the whole dataset depends on. Discarded slices are counted into `n_skipped_bg` and reported per-orientation and in the final summary.
+The check is applied to the CT **and** the MRI, joined with `or` — **if either side is background, the pair is flagged.** The pair is still saved: a slice near the FOV edge can carry a thin sliver of real anatomy, and a fixed 90% threshold can't tell that apart from true empty air, so nothing is discarded here. Instead the pair is tagged `is_background=True` in `metadata.csv`, counted into `n_flagged_bg`, and reported per-orientation and in the final summary — filtering, if wanted, is a dataloader-level decision.
 
 Tunable via `--bg_thresh` and `--bg_fraction`.
 
@@ -385,7 +385,7 @@ python preprocess_2d.py --data_root ../Raw_data_mri_ct/Rawdata_dicom --output_di
 # One patient, full-resolution N4 (slow but highest quality)
 python preprocess_2d.py --patient PA0_Ranjeet --n4_shrink 1
 
-# Looser background filter (keep more sparse slices)
+# Looser background flag (fewer sparse slices get tagged is_background)
 python preprocess_2d.py --bg_fraction 0.97
 
 # Wider MRI percentile clipping

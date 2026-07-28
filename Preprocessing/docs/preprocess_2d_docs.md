@@ -39,10 +39,10 @@ It uses `img_proc.volume_to_slices` to shatter the 3D SimpleITK volumes into a l
 For every matching 2D slice in the CT and MRI:
 1. **(Optional) Register**: If `--register_2d` was passed, `img_proc.register_2d_rigid` nudges the MRI slice to align with the CT slice via gradient descent.
 2. **Normalize**: It applies the Hounsfield Window to the CT (`norm.normalize_ct_slice`), and the Percentile Clipping to the MRI (`norm.normalize_mri_slice`), scaling both to `[0, 1]`.
-3. **Filter Background**: If `90%` of the slice is black air, it throws it in the trash (`SKIP`).
+3. **Flag Background**: If `90%` of the slice is black air, it's tagged `is_background=True` in `metadata.csv` — but still saved. Slices near the FOV edge can carry a thin sliver of real anatomy, so nothing is silently discarded here; filtering (if wanted) is left to the GAN's dataloader.
 4. ~~**Crop & Pad**~~: **Removed.** The pipeline no longer crops. Slices are kept at their native post-resample size, and cropping is done by the GAN's dataloader instead — so you can change crop strategy or input resolution without re-running preprocessing.
 
 ### Step 5: Saving
-Finally, it saves the aligned, `[0,1]` normalized 2D numpy arrays into the output folder as `.npy` files, along with their dimensions (`height`, `width`) in `metadata.csv`.
+Finally, it saves the aligned, `[0,1]` normalized 2D numpy arrays into the output folder as `.npy` files, along with their dimensions (`height`, `width`) and the `is_background` flag in `metadata.csv`.
 
 > ⚠️ Because slices are no longer a uniform square, **`torch.stack` will fail on a naive batch**. Your `Dataset.__getitem__` must crop or pad to a common size first — see [`mri_pipeline_docs.md`](./mri_pipeline_docs.md) §12 for a drop-in implementation. Apply the *same* crop to the CT and the MRI of a pair, or you will destroy their pixel-level alignment.

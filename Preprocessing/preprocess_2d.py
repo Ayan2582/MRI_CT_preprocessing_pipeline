@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bg_thresh",      type=float, default=cfg.BG_INTENSITY_THRESH,
                    help="Normalised intensity below which a pixel counts as background")
     p.add_argument("--bg_fraction",    type=float, default=cfg.BG_PIXEL_FRACTION,
-                   help="Fraction of bg pixels above which a slice is discarded")
+                   help="Fraction of bg pixels above which a slice is flagged (kept, not discarded)")
     p.add_argument("--save_png",       action="store_true", default=cfg.SAVE_PNG,
                    help="Save side-by-side CT|MRI PNG previews")
     p.add_argument("--skip_existing",  action="store_true", default=cfg.SKIP_EXISTING,
@@ -151,7 +151,7 @@ def main():
     # Initialize tracking variables so we can generate a CSV file and a summary report at the very end.
     metadata_rows        = []
     total_pairs          = 0
-    total_bg_skipped     = 0
+    total_bg_flagged     = 0
     patients_ok          = 0
     patients_skipped_mri = 0
     orient_counts        = {o: 0 for o in cfg.ORIENTATIONS}
@@ -259,11 +259,11 @@ def main():
                     ct_entry, mri_entry, orient,
                     pat_out, args, log, metadata_rows, patient_id
                 )
-                
-                # Keep track of how many 2D slices were successfully saved vs thrown away.
+
+                # Keep track of how many 2D slices were saved, and how many were flagged (but kept) as background.
                 patient_pairs    += n_saved
                 total_pairs      += n_saved
-                total_bg_skipped += n_bg
+                total_bg_flagged += n_bg
                 if n_saved > 0:
                     orient_counts[orient] += n_saved
             except Exception as exc:
@@ -279,7 +279,7 @@ def main():
         "patient_id", "body_region", "orientation", "slice_index",
         "ct_series", "mri_series", "mri_desc",
         "height", "width",
-        "ct_npy", "mri_npy",
+        "ct_npy", "mri_npy", "is_background",
     ]
     with open(meta_path, "w", newline="", encoding="utf-8") as f:
         # DictWriter converts our Python list-of-dictionaries directly into an Excel-style CSV sheet.
@@ -294,7 +294,7 @@ def main():
     log.info(f"  Patients processed       : {patients_ok} / {len(patients)}")
     log.info(f"  Patients skipped (no MRI): {patients_skipped_mri}")
     log.info(f"  Total paired slices saved: {total_pairs}")
-    log.info(f"  Slices discarded (bg)    : {total_bg_skipped}")
+    log.info(f"  Slices flagged (bg, kept): {total_bg_flagged}")
     log.info("  Breakdown by orientation :")
     for orient, count in orient_counts.items():
         log.info(f"    {orient:10s}: {count} slices")

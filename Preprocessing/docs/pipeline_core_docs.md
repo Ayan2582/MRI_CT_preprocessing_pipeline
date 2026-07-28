@@ -121,9 +121,9 @@ def process_orientation_pair(
         f"p{args.mri_p_low}={p1:.1f}  p{args.mri_p_high}={p99:.1f}"
     )
 
-    # -- Steps 5-8: Normalise / filter / save --  (cropping now happens at dataloader time)
+    # -- Steps 5-8: Normalise / flag / save --  (cropping now happens at dataloader time)
     n_saved      = 0
-    n_skipped_bg = 0
+    n_flagged_bg = 0
 
     # Iterate vertically through the slices one by one.
     for i in range(n_pair):
@@ -141,19 +141,24 @@ def process_orientation_pair(
         ct_norm  = norm.normalize_ct_slice(ct_slice, args.ct_win_min, args.ct_win_max)
         mri_norm = norm.normalize_mri_slice(mri_slice, p1, p99)
 
-        # Background filter: Check if 90% of either slice is just empty black space.
-        # If it is, skip this slice. Neural networks learn nothing from black squares.
+        # Background flag: Check if 90% of either slice is just empty black space.
+        # We no longer discard these — a slice near the FOV edge can still contain a
+        # thin sliver of real anatomy, and silently dropping it risks losing good data.
+        # Instead we tag the pair as "is_background" in the metadata CSV so the GAN's
+        # dataloader can choose to filter, downweight, or keep them, with the decision
+        # visible and reversible instead of baked into this pipeline.
         # [Function Origin: normalization.py]
-        if norm.is_background_slice(ct_norm,  args.bg_thresh, args.bg_fraction) or \
-           norm.is_background_slice(mri_norm, args.bg_thresh, args.bg_fraction):
-            n_skipped_bg += 1
-            continue
+        is_bg = (
+            norm.is_background_slice(ct_norm,  args.bg_thresh, args.bg_fraction) or
+            norm.is_background_slice(mri_norm, args.bg_thresh, args.bg_fraction)
+        )
+        if is_bg:
+            n_flagged_bg += 1
 
         # NOTE: No cropping / padding happens here anymore.
         # Slices are saved at their native post-resample size, which varies per series.
         # Cropping is deferred to the GAN's dataloader so that crop strategy (center,
         # random, body-mask) can be changed and re-tuned without re-running this pipeline.
-        # The recommended per-region crop size is recorded in metadata.csv as 'crop_size'.
         ct_final  = ct_norm
         mri_final = mri_norm
 
@@ -187,9 +192,8 @@ def process_orientation_pair(
         region = cfg.PREFIX_TO_REGION.get(prefix, "default")
 
         # Because slices are no longer cropped to a uniform square, the dataloader cannot
-        # assume a shape. We record the actual saved dimensions plus the recommended crop
-        # size for this body region so the Dataset can crop/pad and filter without having
-        # to open every .npy file first.
+        # assume a shape. We record the actual saved dimensions so the Dataset can size
+        # batches and filter undersized slices without opening every .npy file first.
         h, w = ct_final.shape
 
         # Append all the paths and clinical info to a dictionary so the orchestrator can write it into a giant CSV file.
@@ -204,17 +208,17 @@ def process_orientation_pair(
             "mri_desc":      mri_entry["series_desc"],
             "height":        h,
             "width":         w,
-            "crop_size":     args.target_size,
             "ct_npy":        ct_path,
             "mri_npy":       mri_path,
+            "is_background": is_bg,
         })
         n_saved += 1
 
-    # Print a summary to the console so the user knows exactly how many slices survived the background filter.
+    # Print a summary to the console so the user knows how many slices were flagged as background.
     log.info(
         f"  [{orient}] OK {n_saved} pairs saved | "
-        f"SKIP {n_skipped_bg} background slices discarded"
+        f"FLAGGED {n_flagged_bg} as background (kept, not discarded)"
     )
-    return n_saved, n_skipped_bg
+    return n_saved, n_flagged_bg
 
 ```

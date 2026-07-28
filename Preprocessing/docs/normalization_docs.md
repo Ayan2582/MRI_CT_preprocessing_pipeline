@@ -74,14 +74,15 @@ def normalize_mri_slice(slice_2d, p1, p99):
 
 def is_background_slice(arr, intensity_thresh=0.02, bg_fraction=0.90):
     """
-    [Function 10: Called via pipeline_core.py:140, originating from main script preprocess_2d.py:262]
+    [Function 10: Called via pipeline_core.py:144-149, originating from main script preprocess_2d.py:262]
     Return True if the 2-D slice is predominantly background (uninformative).
     """
     # arr <= intensity_thresh creates a True/False mask where all dark pixels (below 0.02) are True.
     # np.mean calculates the average of this mask, effectively giving the percentage of the image that is dark.
     # If the percentage of dark pixels is greater than the bg_fraction (e.g. 0.90, or 90%)...
-    # Then it returns True (this slice is background air and should be discarded).
-    # This is important because feeding empty black slices to a neural network wastes computation and hurts learning.
+    # Then it returns True (this slice is mostly background air). The caller only tags
+    # the slice as "is_background" in the metadata CSV rather than dropping it, so a
+    # slice with a thin sliver of real anatomy near the FOV edge is never silently lost.
     return float(np.mean(arr <= intensity_thresh)) > bg_fraction
 
 ```
