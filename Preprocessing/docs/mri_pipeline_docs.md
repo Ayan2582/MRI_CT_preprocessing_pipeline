@@ -26,7 +26,7 @@ The single most important idea: **the MRI never gets its own grid.** The CT defi
         ├─ io_utils.discover_series(MRI/<patient>/ST0)     ← Stage 1: Discovery
         │      └─ io_utils.load_dicom_series(SE*)          ← Stage 2: Loading
         │
-        ├─ strict-name pairing loop (preprocess_2d.py:226) ← Stage 3: Pairing
+        ├─ strict-name pairing loop (preprocess_2d.py:230) ← Stage 3: Pairing
         │
         └─ pipeline_core.process_orientation_pair()
                  │
@@ -34,9 +34,11 @@ The single most important idea: **the MRI never gets its own grid.** The CT defi
                  ├─ image_processing.resample_mri_to_ct_grid()    ← Stage 5
                  ├─ image_processing.volume_to_slices()           ← Stage 6
                  ├─ normalization.compute_mri_percentiles()       ← Stage 7
+                 ├─ image_processing.estimate_volume_translation() ← Stage 8  (optional)
+                 │      └─ registration_idea.register()  × N probe slices
                  │
                  └─ per-slice loop:
-                        ├─ image_processing.register_2d_rigid()   ← Stage 8  (optional)
+                        ├─ image_processing.apply_translation()   ← Stage 8  (optional)
                         ├─ normalization.normalize_mri_slice()    ← Stage 9
                         ├─ normalization.is_background_slice()    ← Stage 10
                         │  (Stage 11 crop/pad — REMOVED, see §12)
@@ -47,7 +49,7 @@ The single most important idea: **the MRI never gets its own grid.** The CT defi
 
 ## 2. Stage 1 — Series Discovery
 
-**Code:** `io_utils.discover_series()` · called from `preprocess_2d.py:209`
+**Code:** `io_utils.discover_series()` · called from `preprocess_2d.py:213`
 
 The pipeline walks `Raw_data_mri_ct/Rawdata_dicom/MRI/<patient_id>/ST0/` and iterates its `SE*` sub-folders in sorted order. For each one:
 
@@ -84,7 +86,7 @@ Orientation resolution is a two-step heuristic (`io_utils.py:128–140`):
 
 Orientation is therefore derived from *naming conventions*, not from geometry. A geometrically correct alternative — reading the DICOM direction-cosine matrix — existed as `get_orientation_from_direction()` but was never wired in, and has since been removed (see [`io_utils_docs.md`](./io_utils_docs.md) § Removed helpers). It is worth reviving if string-based detection proves unreliable.
 
-> 🔑 **The MRI is the orientation authority.** In `preprocess_2d.py:237` the orientation of the *pair* is taken from the MRI entry (`orient = m_entry["orientation"]`); the CT's own orientation label is never consulted. If the MRI's orientation resolves to `"unknown"`, the whole pair is skipped with a warning.
+> 🔑 **The MRI is the orientation authority.** In `preprocess_2d.py:240` the orientation of the *pair* is taken from the MRI entry (`orient = m_entry["orientation"]`); the CT's own orientation label is never consulted. If the MRI's orientation resolves to `"unknown"`, the whole pair is skipped with a warning.
 
 ---
 
@@ -102,7 +104,7 @@ Uses `sitk.ImageSeriesReader` with `GetGDCMSeriesFileNames()`, which sorts the i
 
 ## 4. Stage 3 — CT ↔ MRI Pairing
 
-**Code:** `preprocess_2d.py:226–244`
+**Code:** `preprocess_2d.py:230–248`
 
 For each MRI series, the pipeline takes the folder basename, splits on `_`, and looks for a CT series whose basename splits to the same token:
 
@@ -119,11 +121,16 @@ This "strict name match" assumes the two modalities were exported with a consist
 
 ## 5. Stage 4 — N4 Bias Field Correction ⭐ *MRI-only*
 
-**Code:** `image_processing.apply_n4_bias_correction()` · called from `pipeline_core.py:74`
+**Code:** `image_processing.apply_n4_bias_correction()` · called from `pipeline_core.py`
 
 This stage has **no CT equivalent** — it corrects an artefact that only exists in MR physics.
 
-### What it fixes
+> **Changed 2026-08-08.** This stage used to run in 2D, one independent fit per
+> slice. It now fits **one field to the whole 3D volume**, with a deliberately
+> anisotropic control point mesh. The rest of this section describes the new
+> behaviour; §5.4 records what was wrong with the old one.
+
+### 5.1 What it fixes
 MRI receive coils are not uniformly sensitive across their field of view. The result is a smooth, low-frequency intensity gradient — the same tissue appears brighter near the coil and darker far from it. This "bias field" is multiplicative:
 
 ```
@@ -132,33 +139,102 @@ observed(x) = true(x) · exp(bias(x)) · noise
 
 Left uncorrected, a percentile-based normaliser (Stage 7) computes bounds that are wrong for half the image, and a GAN learns to reproduce the coil shading instead of the anatomy.
 
-### How it is done here
+The word doing the work is **x**. It is a point in the bore, not a point in a slice. `bias` is one continuous function over the whole volume, so it has to be estimated as one.
+
+### 5.2 How it is done here
 
 | Parameter | Value | Reason |
 |---|---|---|
-| Mode | **2D, slice-by-slice** | Not 3D. The data is highly anisotropic (thin in-plane, ~4 mm slice gaps) and volumes can be as short as 18 slices — the 3D B-spline grid fit fails or destabilises on such thin stacks. |
-| Mask | `sitk.OtsuThreshold(slice, 0, 1, 200)` | Auto-separates tissue from air so N4 does not waste effort modelling the background. |
-| `shrink_factor` | `4` (CLI: `--n4_shrink`) | The bias field is *smooth by definition*, so it can be estimated on a 4× downsampled image at ~16× the speed with negligible loss. |
-| Iterations | `[50, 50, 50, 50]` | 4-level multi-resolution pyramid. |
+| Mode | **3D, whole volume** | The bias field is a property of the coil, which does not know where the slice boundaries are. |
+| Mask | `sitk.OtsuThreshold(volume, 0, 1, 200)` | Auto-separates tissue from air. Computed on the **volume**: a nearly-empty slice has no bimodal histogram, and a per-slice Otsu on one calls its own noise "tissue". |
+| Control points, in-plane | derived per series, **6–20** | Targets a fixed *physical* spacing (25–35 mm), so a 180 mm knee and a 400 mm abdomen get the same field stiffness rather than the same number. |
+| Control points, through-plane | **4**, fixed | The fewest a cubic spline can have — one single span across the slab. See §5.3. |
+| `shrink_factor` | `4`, **in-plane only** (CLI: `--n4_shrink`) | The field is smooth, so estimating it on a 4× downsampled grid is ~16× faster with negligible loss. Auto-reduced if it would leave fewer than 2 voxels per control point. z is **never** shrunk — these stacks are 15–24 slices, and shrinking z by 4 leaves nothing to fit across. |
+| Spline order | `3` (cubic) | ITK's order is global — it cannot differ per axis. All the anisotropy therefore has to come from the control point counts. |
+| Fitting levels | `1` × 100 iterations | ITK doubles the mesh on every extra level, **in all axes at once**. More than one level makes it impossible to keep z coarse while refining in-plane. One level makes the configured numbers mean exactly what they say. |
 | Convergence | `0.001` | Early-exit threshold. |
 
-The correction itself (`image_processing.py:70–76`):
+The correction itself:
 
-1. Fit N4 on the **shrunken** slice + mask.
-2. Ask for the log bias field evaluated at **full resolution** — `GetLogBiasFieldAsImage(slice_2d)`. This is the key trick: estimate cheap, apply sharp.
-3. Divide: `corrected = slice_2d / sitk.Exp(log_bias)`.
+1. Fit N4 on the **in-plane-shrunken** volume + mask.
+2. Ask for the log bias field evaluated at **full resolution** — `GetLogBiasFieldAsImage(image_f32)`. The field is a smooth analytic B-spline, so this is an exact evaluation, not an upsample. Estimate cheap, apply sharp.
+3. Divide: `corrected = image_f32 / sitk.Exp(log_bias)`.
 
-If N4 throws (typically on a slice that is pure air, where Otsu produces a degenerate mask), the exception is caught and the **uncorrected slice is used** with a warning — one bad slice never kills a patient.
+If N4 throws, the exception is caught and the **whole volume is used uncorrected** with a warning. This is now all-or-nothing per volume on purpose: a stack where some slices were corrected and some were not is worse than one where none were, because the inconsistency is invisible downstream.
 
-### The `JoinSeries` geometry trap
+### 5.3 Why the mesh is anisotropic
 
-Slices are stitched back with `sitk.JoinSeries()`, which refuses to merge 2D images whose origin/direction differ by even a floating-point epsilon. The code defends against this by capturing `base_origin` / `base_direction` at `z == 0` and force-stamping them onto every corrected slice (`image_processing.py:84–85`). Afterwards the original 3D `Spacing`, `Direction`, and `Origin` are copied back onto the joined volume (`:96–98`) so the physical DICOM geometry is preserved for Stage 5.
+This is the part that makes 3D safe on stacks this thin, and it is the answer to the objection that used to justify the 2D version.
+
+In SimpleITK index order, **axis 2 is the slice axis for every DICOM series**, so "in-plane" is always axes 0 and 1 and needs no lookup. What *does* depend on the acquisition plane is which anatomical direction each axis carries:
+
+| orientation | axis 0 | axis 1 | axis 2 (through-plane) |
+|---|---|---|---|
+| axial | L-R | A-P | S-I |
+| coronal | L-R | S-I | A-P |
+| sagittal | A-P | S-I | L-R |
+
+In-plane targets are set per anatomical direction, so a direction gets the same stiffness whichever plane it shows up in (`pipeline_config.N4_CONTROL_POINT_SPACING_MM`):
+
+* **L-R — 35 mm.** Body/spine coil shading across the patient is broad and roughly symmetric; least freedom needed.
+* **A-P — 30 mm.** Anterior array against posterior spine coil is the strongest single gradient in most of these scans.
+* **S-I — 25 mm.** Coil arrays are segmented along the bore axis, so sensitivity changes fastest head-to-foot; most freedom needed.
+
+Through-plane gets **one span, always**. The reasoning is that these are 2D multi-slice acquisitions with 5–10 mm slices, where through-plane intensity variation is largely *not* a bias field — it is slice profile, cross-talk and per-slice excitation. Those are genuinely discontinuous between neighbouring slices, and any mesh flexible enough to follow them is flexible enough to follow anatomy. One rigid cubic span lets N4 remove a smooth head-to-foot coil falloff and express nothing sharper.
+
+That also disposes of the old worry that "a 3D B-spline fit destabilises on an 18-slice stack". It destabilises when the z mesh has more freedom than the stack has slices. Here the z mesh has the least freedom a spline can have — 4 control points against 15–24 slices — so there is nothing to destabilise. Verified to run without error down to 2-slice volumes.
+
+The counts are **derived per series, not fixed**, because the MRI in this dataset spans 180 mm (knee sagittal) to 400 mm (abdomen axial) of in-plane FOV. A fixed count would mean a 15 mm mesh on the knee and a 33 mm mesh on the abdomen — two completely different amounts of freedom, and the 15 mm one is well into the range where N4 starts flattening real tissue contrast. For a spline of order `p`, `ncp` control points give `ncp - p` spans, so:
+
+```
+ncp = p + round(FOV_mm / target_spacing_mm)      clamped to [6, 20]
+```
+
+`plan_n4_control_points()` does this and is importable on its own if you want to inspect the mesh for a series without running the fit. The chosen mesh is logged per series at INFO.
+
+> ⚠️ The mm targets are reasoned from coil geometry, **not** tuned against a measured criterion on this dataset. They are the first knob to turn if N4 is visibly eating anatomy (raise them) or leaving shading behind (lower them).
+
+### 5.4 What was wrong with the 2D version
+
+Every slice got its own independent bias field, and a bias field includes an overall scale. So every slice was free to choose its own brightness, with nothing tying it to its neighbours.
+
+Two consequences:
+
+1. **It manufactured slice-to-slice steps.** Adjacent slices that agreed in the raw data could come out at different brightness, purely as an artefact of two independent fits.
+2. **It could not see, let alone remove, through-plane shading.** A head-to-foot coil falloff is invisible to any single-slice fit — within one slice it is a constant, and a constant is exactly what a per-slice fit absorbs into that slice's own scale. So the one component of the field that most needs a volume to detect was the one component guaranteed to survive.
+
+Both feed straight into Stage 7, which computes normalisation percentiles over the whole volume: a stack with manufactured brightness steps produces percentiles that fit no slice properly.
+
+The old code also needed a workaround that no longer exists — see §5.5.
+
+#### Measured, 12 series across 4 patients, all three orientations
+
+The artefact in (1) is measurable directly, and separately from anatomy. For each slice `k`, the effective gain N4 applied is `g_k = mean(corrected_k) / mean(raw_k)` over tissue voxels — real anatomy cancels in that ratio. A legitimate 3D field makes `g_k` vary smoothly with `k`; independent per-slice fits make it jump. Score it as `mean|g_k − g_{k−1}| / mean(g)`:
+
+| | old (2D per-slice) | new (3D) |
+|---|---|---|
+| median gain roughness | 0.0668 | **0.0081** |
+| series where the other one wins | — | **0 / 12** |
+
+An **8× reduction, on every series tested**, with the worst case (`PA11_Shivam/SE1`, sagittal) going from 0.196 to 0.020. That is the change this rewrite was for.
+
+> ⚠️ **The second half of the measurement is not a clean win, and should not be reported as one.** Coefficient of variation of tissue intensity — a crude proxy for "how much shading is left" — comes out essentially unchanged overall (median 0.334 old vs 0.335 new), with the new version better on 5 of 12 series and worse on 7.
+>
+> The split is systematic and makes sense. The large-FOV abdomen series improve substantially (`PA12_Mamta/SE2` 0.350 → 0.205, `SE1` 0.273 → 0.240) — those are exactly the volumes with strong A-P shading from body array against spine coil, which no 2D fit can see. The brain series get slightly worse (`PA0_Ranjeet/SE0` 0.254 → 0.264), and on `PA11_Shivam/SE0` the 3D fit leaves CV *above* the raw volume (0.578 raw → 0.612).
+>
+> Two things to keep in mind before reading that as a regression. First, CV is a bad criterion on its own: 18 independent 2D fields have far more total freedom than one 3D field, and some of the variance they remove is real tissue contrast, which is a loss dressed up as an improvement. Second, `PA11_Shivam/SE0` is worth actually looking at rather than explaining away — it is the one case here where the correction demonstrably made a volume less uniform than it started.
+
+### 5.5 Retired: the `JoinSeries` geometry trap
+
+The 2D version took the volume apart and put it back together with `sitk.JoinSeries()`, which refuses to merge 2D images whose origin/direction differ by even a floating-point epsilon. It defended against this by capturing `base_origin` / `base_direction` at `z == 0` and force-stamping them onto every corrected slice, then copying the original 3D geometry back onto the joined volume.
+
+None of that exists any more. The volume is never disassembled, so its geometry is never at risk. Kept here only so the removal is not mistaken for an oversight.
 
 ---
 
 ## 6. Stage 5 — Projection onto the CT Grid ⭐ *the alignment step*
 
-**Code:** `image_processing.resample_mri_to_ct_grid()` · called from `pipeline_core.py:92`
+**Code:** `image_processing.resample_mri_to_ct_grid()` · called from `pipeline_core.py:100`
 
 The N4-corrected MRI is resampled with **the already-resampled CT volume as the reference image**:
 
@@ -171,7 +247,7 @@ resampler.SetTransform(sitk.Transform())   # identity: trust the DICOM coordinat
 
 Consequences worth internalising:
 
-* The MRI ends up with **exactly the CT's voxel count and slice count**, which is why `pipeline_core.py:103` can assume `len(ct_slices) == len(mri_slices)` and index them with a single loop counter.
+* The MRI ends up with **exactly the CT's voxel count and slice count**, which is why `pipeline_core.py:111` can assume `len(ct_slices) == len(mri_slices)` and index them with a single loop counter.
 * The MRI inherits the CT's **1.0 mm in-plane spacing** — `--target_spacing` is never applied to the MRI directly.
 * The identity transform means alignment relies **entirely on the DICOM patient-coordinate system** being consistent between the two scanners. There is no intensity-driven 3D registration.
 * MRI voxels that fall outside the CT's field of view are simply lost; CT regions the MRI never covered are filled with `0.0`.
@@ -179,7 +255,7 @@ Consequences worth internalising:
 ### The direction-cosine override
 
 ```python
-mri_aligned.SetDirection(ct_image.GetDirection())   # image_processing.py:156
+mri_aligned.SetDirection(ct_image.GetDirection())   # image_processing.py:279
 ```
 
 This *asserts* that the MRI shares the CT's orientation rather than letting the resampler reconcile a small angular difference. A sub-degree tilt discrepancy, resolved across a stack only 18 slices deep, produces visible shear/staircase artefacts. Forcing the direction trades a tiny, uncorrected rotation for a geometrically clean volume.
@@ -190,7 +266,7 @@ This *asserts* that the MRI shares the CT's orientation rather than letting the 
 
 ## 7. Stage 6 — Volume → Slices
 
-**Code:** `image_processing.volume_to_slices()` · `pipeline_core.py:99`
+**Code:** `image_processing.volume_to_slices()` · `pipeline_core.py:107`
 
 `sitk.GetArrayFromImage()` converts `(x, y, z)` ITK ordering into NumPy `(z, y, x)` ordering, then the list comprehension yields one `(y, x)` array per slice. From this point on the MRI is **plain NumPy**, not SimpleITK.
 
@@ -198,7 +274,7 @@ This *asserts* that the MRI shares the CT's orientation rather than letting the 
 
 ## 8. Stage 7 — Percentile Bounds ⭐ *MRI-only*
 
-**Code:** `normalization.compute_mri_percentiles()` · `pipeline_core.py:110`
+**Code:** `normalization.compute_mri_percentiles()` · `pipeline_core.py:118`
 
 Because MRI has no absolute intensity scale, normalisation bounds must be derived **per series**, not from a fixed constant.
 
@@ -218,31 +294,72 @@ Defaults `0.5` / `99.5` (`--mri_p_low`, `--mri_p_high`) clip the extreme tails �
 
 ---
 
-## 9. Stage 8 — Optional 2D Rigid Registration
+## 9. Stage 8 — Optional Translation Registration
 
-**Code:** `image_processing.register_2d_rigid()` · `pipeline_core.py:128–130` · flag `--register_2d`
+**Code:** `image_processing.estimate_volume_translation()` + `apply_translation()` · method in `registration_idea.py` · flag `--register_2d`
 
-Off by default. When enabled, each MRI slice is aligned to its CT partner:
+Off by default. Stage 5 already aligns the two modalities through their DICOM
+patient coordinates; this stage exists for the pairs where those coordinates are
+wrong. It measures the leftover in-plane offset and takes it out.
 
-| Component | Choice | Reason |
+**The method** (`registration_idea.py`): both images are already at 1 mm per
+pixel by Stage 5, so slide the MRI over the CT one whole pixel at a time and
+keep the position with the best normalised mutual information. The search is
+coarse-to-fine — a strided sweep, then every whole pixel around the best few.
+
+Two properties fall out of that and neither is a tuning choice:
+
+* **A whole-pixel slide cannot rotate, scale or shear**, so the three failure
+  modes in `registration_gates_docs.md` are not gated against here — they are
+  not expressible. This is the difference from the old gradient-descent
+  `Euler2DTransform` approach, which could express all three and needed gates.
+* **There are no random numbers**, so two runs over the same data give the same
+  shift. The old approach sampled 20 % of pixels at random with no seed.
+
+### One shift per volume, not one per slice
+
+The shift is estimated on `REG_N_PROBES` slices spread through the stack and
+then applied to **every** slice of it. Registering slices independently is the
+same mistake the 3D N4 rewrite removed (§5), in a different variable: it hands
+each slice its own free translation, so the MRI shears through z relative to the
+CT and continuous anatomy comes out as a staircase. On this dataset the best
+per-slice shift swings 85 mm across one shoulder axial stack — see
+`sweep_idea_2_summary.csv`.
+
+### How the answer is defended
+
+Four checks, in order. Any failure means **no shift at all**, never a worse one:
+
+| # | Check | Config |
 |---|---|---|
-| Transform | `Euler2DTransform` | Rotation + translation only. No scaling/shear — anatomy must not be deformed. |
-| Init | `CenteredTransformInitializer(..., GEOMETRY)` | Start from centre-of-image alignment. |
-| Metric | **Mattes Mutual Information**, 50 bins | Mandatory for cross-modality. Bone is white on CT and black on MRI, so intensity-difference metrics (MSE, NCC) are meaningless here; MI matches *statistical structure* instead. |
-| Sampling | 20 % random | ~5× speedup at negligible accuracy cost. |
-| Optimiser | Gradient descent, lr `0.1`, 100 iters | With `SetOptimizerScalesFromPhysicalShift()` so rotation and translation steps are comparably scaled. |
-| Pyramid | shrink `[4, 2, 1]`, sigmas `[2, 1, 0]` | Coarse-to-fine, to avoid local minima. |
+| 0 | A probe whose best shift lands on the edge of the search square is discarded — that is a wall, not a peak, so the value is censored rather than measured | `REG_SEARCH_MM` |
+| 1 | Enough probes survived check 0 | `REG_MIN_PROBES` |
+| 2 | The survivors agree with each other | `REG_MAX_SPREAD_MM` |
+| 3 | Their median, re-scored on every probe, actually raises NMI on average | `REG_MIN_GAIN` |
 
-> 🐛 **Known issue — `--register_2d` is currently broken.**
-> By the time the per-slice loop runs, `ct_slice` and `mri_slice` are **NumPy arrays** (Stage 6), but `register_2d_rigid()` opens with `sitk.Cast(fixed_slice, ...)` at `image_processing.py:180`, which requires a `SimpleITK.Image`. That call sits *outside* the function's `try` block (which begins at `:224`), so it raises rather than falling back. The exception propagates up to the per-pair handler at `preprocess_2d.py:273`, which logs `Unhandled error` and abandons the entire orientation pair.
-> Even if the cast were fixed, the function returns a `SimpleITK.Image`, which `normalize_mri_slice()` would then call `.astype()` on — a second failure.
-> **Fixing this requires converting to/from `sitk.GetImageFromArray` / `sitk.GetArrayFromImage` around the call.** Until then, run without the flag; Stage 5 already provides DICOM-coordinate alignment.
+Check 0 has to come first rather than being a warning after the fact: probes
+pinned against the same wall all report the same number, so they would pass
+check 2 with a spread of zero and unanimous censorship would read as unanimous
+evidence. When it fires, the log says so and names the fix (raise
+`--reg_search_mm`).
+
+Check 3 is the one that matters most. Checks 1 and 2 ask whether the per-slice
+searches agreed; check 3 measures the shift that is actually about to be
+applied, which — being a median — may be a position no probe ever proposed.
+
+### What lands in the CSV
+
+Every row carries `reg_applied`, `reg_dx_mm`, `reg_dy_mm`, `reg_nmi_gain` and
+`reg_note`. The measured shift is recorded **even when it was rejected**, and
+`reg_note` is the plain-English reason. Nobody is going to inspect 2313 overlays
+by hand, so this is what keeps a bad registration findable afterwards instead of
+baked silently into the `.npy`.
 
 ---
 
 ## 10. Stage 9 — Intensity Normalisation
 
-**Code:** `normalization.normalize_mri_slice()` · `pipeline_core.py:135`
+**Code:** `normalization.normalize_mri_slice()` · `pipeline_core.py:143`
 
 ```python
 s = np.clip(slice_2d, p1, p99)
@@ -257,7 +374,7 @@ The same `p1`/`p99` are reused for **every slice in the series**, which is what 
 
 ## 11. Stage 10 — Background Flagging
 
-**Code:** `normalization.is_background_slice()` · `pipeline_core.py:144–149`
+**Code:** `normalization.is_background_slice()` · `pipeline_core.py:152–154`
 
 ```python
 np.mean(arr <= 0.02) > 0.90
@@ -347,7 +464,7 @@ Before each patient, the ID prefix (`PA0_Ranjeet` → `PA0`) is looked up to sel
 
 ## 14. Stage 12 — Export
 
-**Code:** `export_utils.save_npy()` / `save_preview_png()` · `pipeline_core.py:162–172`
+**Code:** `export_utils.save_npy()` / `save_preview_png()` · `pipeline_core.py:178–186`
 
 ```
 <output_dir>/<patient_id>/<orientation>/mri/ct_<CTSERIES>_mri_<MRISERIES>_<idx:03d>.npy
@@ -392,18 +509,18 @@ python preprocess_2d.py --bg_fraction 0.97
 python preprocess_2d.py --mri_p_low 1.0 --mri_p_high 99.0
 ```
 
-MRI-relevant flags: `--n4_shrink`, `--mri_p_low`, `--mri_p_high`, `--register_2d` (see §9 caveat), `--bg_thresh`, `--bg_fraction`, `--save_png`, `--skip_existing`, `--patient`.
+MRI-relevant flags: `--n4_shrink`, `--mri_p_low`, `--mri_p_high`, `--register_2d`, `--reg_search_mm` (§9), `--bg_thresh`, `--bg_fraction`, `--save_png`, `--skip_existing`, `--patient`.
 
 ---
 
 ## 16. Known Limitations (MRI side)
 
-1. **`--register_2d` raises on the NumPy/SimpleITK type boundary** — see §9.
+1. **`--register_2d` corrects translation only, and only when it can prove it should.** Rotation and scale errors are not expressible by the method (§9) and so are not corrected. Pairs whose probe slices disagree, or whose offset is further out than `--reg_search_mm`, are deliberately left unshifted — `reg_note` in the CSV says which, and how many were rejected is worth checking after a run.
 2. **Orientation comes from strings, not geometry.** A series named `SE3` with an unhelpful description resolves to `"unknown"` and is dropped. The direction-cosine method was removed rather than wired in.
 3. **T1 and T2 are mixed.** Nothing in the pipeline separates them — a percentile-normalised T1 and T2 both land in `[0, 1]` with inverted tissue contrast. Only `mri_desc` in the CSV distinguishes them.
 4. **Bias correction is 2D.** Deliberate (see §5), but it means through-plane intensity drift is not corrected.
 5. **PA32 covers two anatomies (knee + ankle).** Strict name matching does not know this; `dataset_context.txt` flags that it should be split into two logical patients to prevent a knee MRI pairing with an ankle CT.
-6. **No in-plane rotation correction.** With registration off, alignment is only as good as the DICOM patient coordinates from the two scanners.
+6. **No in-plane rotation correction, ever.** `--register_2d` slides; it does not turn. With registration off, alignment is only as good as the DICOM patient coordinates from the two scanners.
 7. **`SKIP_EXISTING = True` by default** — re-running will skip any patient whose output directory already contains sub-directories. Delete the folder to reprocess.
 8. **Output arrays are no longer a uniform shape** (§12). This is intentional, but it means the dataloader — not the pipeline — is now responsible for producing batchable tensors and for not clipping off-centre anatomy.
 

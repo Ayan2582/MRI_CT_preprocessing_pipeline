@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 def get_orientation_from_desc(description):
     """
-    [Function 1.2: Used by io_utils.py:126 inside discover_series]
+    [Function 1.2: Used by io_utils.py:121 inside discover_series]
     Heuristic orientation guess from a DICOM series description string.
     """
     # Convert the human-written description string (like "T2_AXIAL_1") to all lowercase.
@@ -38,7 +38,7 @@ def get_orientation_from_desc(description):
 
 def load_dicom_series(series_path):
     """
-    [Function 1.1: Used by io_utils.py:108 inside discover_series]
+    [Function 1.1: Used by io_utils.py:95 inside discover_series]
     Load a DICOM series directory as a SimpleITK image.
     """
     try:
@@ -81,7 +81,7 @@ def load_dicom_series(series_path):
 
 def discover_series(study_path):
     """
-    [Function 1: Used first in the main pipeline at preprocess_2d.py:207]
+    [Function 1: Used first in the main pipeline at preprocess_2d.py:211]
     Enumerate all DICOM series (SE* subdirectories) under a study path and
     return metadata for each successfully loaded series.
     """
@@ -134,7 +134,6 @@ def discover_series(study_path):
         })
 
     return series_list
-
 ```
 
 ---

@@ -2,6 +2,12 @@
 
 This module is the Orchestrator. It contains the central logic loop that ties all of the isolated processing modules together into one smooth pipeline.
 
+> **Changed 2026-08-08 —** Step 1 now runs N4 on the whole 3D MRI volume instead
+> of slice by slice, and is passed `orientation` so the B-spline mesh can be
+> anisotropic. It has to stay at Step 1: everything after it works one slice at
+> a time, and once the stack is taken apart the through-plane half of the bias
+> field is invisible. See [`mri_pipeline_docs.md` §5](./mri_pipeline_docs.md).
+
 ---
 
 ```python
@@ -28,7 +34,7 @@ def process_orientation_pair(
     patient_id:    str,
 ) -> tuple[int, int]:
     """
-    [Function 2: Used in the main pipeline at preprocess_2d.py:262]
+    [Function 2: Used in the main pipeline at preprocess_2d.py:266]
     Run the full preprocessing pipeline for one orientation pair.
     
     EXPECTED VARIABLE CONTENTS:
@@ -49,7 +55,7 @@ def process_orientation_pair(
        Example: "C:/Outputs/PA0_Ranjeet"
        
     4. args: The parsed terminal commands (argparse.Namespace).
-       Contains dynamic settings like args.target_size (e.g. 256) and args.ct_win_min.
+       Contains dynamic settings like args.ct_win_min and args.ct_win_max.
        
     5. log: The logging.Logger object used to print messages to the console safely.
        
@@ -73,13 +79,21 @@ def process_orientation_pair(
         os.makedirs(prev_dir, exist_ok=True)
 
     # -- Step 1: N4 bias field correction (MRI only) --
-    log.info(f"  [{orient}] Applying N4 bias field correction to MRI "
-             f"(shrink_factor={args.n4_shrink}) ...")
+    log.info(f"  [{orient}] Applying 3D N4 bias field correction to the MRI volume "
+             f"({mri_entry['n_slices']} slices, shrink_factor={args.n4_shrink}) ...")
     # Execute the N4 Bias Correction to flatten uneven magnetic lighting in the MRI.
-    # We do this immediately because all future mathematical steps require good lighting.
-    # [Function Origin: image_processing.py]
+    #
+    # This runs on the WHOLE VOLUME AT ONCE, which is why it has to happen here,
+    # before any of the steps below. Every later step works one slice at a time,
+    # and once the stack has been taken apart the through-plane half of the bias
+    # field is no longer visible to anything.
+    #
+    # `orient` is passed through because the mesh is anisotropic and which
+    # anatomical direction each in-plane axis carries depends on the acquisition
+    # plane. [Function Origin: image_processing.py]
     mri_corrected = img_proc.apply_n4_bias_correction(
         mri_entry["image"],
+        orientation=orient,
         shrink_factor=args.n4_shrink,
     )
 
@@ -121,6 +135,42 @@ def process_orientation_pair(
         f"p{args.mri_p_low}={p1:.1f}  p{args.mri_p_high}={p99:.1f}"
     )
 
+    # -- Step 4.5: Translation registration (optional, --register_2d) --
+    # Step 2 already put the MRI on the CT's physical grid, so the two stacks
+    # agree wherever the DICOM origins are trustworthy. Where they are not, this
+    # measures the leftover in-plane offset and takes it out.
+    #
+    # ONE shift is estimated for the whole stack and applied to every slice.
+    # Registering slices independently would hand each one its own translation
+    # and shear the MRI through z — the same failure the 3D N4 fit above exists
+    # to avoid. See image_processing.estimate_volume_translation.
+    #
+    # This runs AFTER the percentiles are computed, and that ordering is safe:
+    # shifting moves pixels around but does not change their values, and the
+    # only new values it introduces are the 0.0 fill, which
+    # compute_mri_percentiles already excludes along with the existing
+    # background. Registering first would give the same p1/p99 at more cost.
+    reg = None
+    if args.register_2d:
+        log.info(f"  [{orient}] Estimating one in-plane shift for the whole stack "
+                 f"(search +/-{args.reg_search_mm:.0f} mm, "
+                 f"{cfg.REG_N_PROBES} probe slices) ...")
+        # [Function Origin: image_processing.py]
+        reg = img_proc.estimate_volume_translation(
+            ct_slices, mri_slices,
+            spacing_mm=args.target_spacing,
+            search_mm=args.reg_search_mm,
+        )
+        verdict = "APPLIED" if reg["applied"] else "NOT applied"
+        log.info(f"  [{orient}] Registration {verdict}: {reg['reason']}")
+        if reg["hit_edge"]:
+            log.warning(
+                f"  [{orient}] {reg['hit_edge']} of {reg['n_probes']} probe slices put the best "
+                f"shift on the edge of the search square and were discarded. The real offset is "
+                f"further out than +/-{args.reg_search_mm:.0f} mm - re-run this pair with a "
+                f"larger --reg_search_mm to measure it."
+            )
+
     # -- Steps 5-8: Normalise / flag / save --  (cropping now happens at dataloader time)
     n_saved      = 0
     n_flagged_bg = 0
@@ -131,10 +181,13 @@ def process_orientation_pair(
         ct_slice = ct_slices[i]
         mri_slice = mri_slices[i]
         
-        # If the user enabled Registration, use Gradient Descent to rotate/shift the MRI slice to perfectly match the CT.
-        if args.register_2d:
+        # Apply the single stack-wide shift measured above. Every slice gets the
+        # same one, so their alignment relative to each other is untouched.
+        if reg is not None and reg["applied"]:
             # [Function Origin: image_processing.py]
-            mri_slice = img_proc.register_2d_rigid(ct_slice, mri_slice)
+            mri_slice = img_proc.apply_translation(
+                mri_slice, ct_slice.shape, reg["dy"], reg["dx"])
+
         
         # Normalise both arrays so their pixel intensities range strictly between 0.0 and 1.0.
         # [Function Origin: normalization.py]
@@ -191,13 +244,13 @@ def process_orientation_pair(
         prefix = patient_id.split("_")[0]
         region = cfg.PREFIX_TO_REGION.get(prefix, "default")
 
+        # Append all the paths and clinical info to a dictionary so the orchestrator can write it into a giant CSV file.
+        # Deep Learning Dataloaders (like in PyTorch) use these CSV files to find the images on the hard drive during training!
         # Because slices are no longer cropped to a uniform square, the dataloader cannot
         # assume a shape. We record the actual saved dimensions so the Dataset can size
         # batches and filter undersized slices without opening every .npy file first.
         h, w = ct_final.shape
 
-        # Append all the paths and clinical info to a dictionary so the orchestrator can write it into a giant CSV file.
-        # Deep Learning Dataloaders (like in PyTorch) use these CSV files to find the images on the hard drive during training!
         metadata_rows.append({
             "patient_id":    patient_id,
             "body_region":   region,
@@ -211,6 +264,17 @@ def process_orientation_pair(
             "ct_npy":        ct_path,
             "mri_npy":       mri_path,
             "is_background": is_bg,
+            # What registration did to this slice, recorded whether or not it
+            # was applied. Nobody is going to look at 2313 overlays by hand, so
+            # this is how a shift that went wrong stays findable afterwards
+            # instead of being baked invisibly into the .npy. reg_dx_mm and
+            # reg_dy_mm carry the measured shift even when reg_applied is False,
+            # which is what makes the rejections searchable too.
+            "reg_applied":   bool(reg["applied"]) if reg else False,
+            "reg_dx_mm":     reg["dx_mm"] if reg else 0.0,
+            "reg_dy_mm":     reg["dy_mm"] if reg else 0.0,
+            "reg_nmi_gain":  reg["mean_gain"] if reg else "",
+            "reg_note":      reg["reason"] if reg else "",
         })
         n_saved += 1
 
@@ -220,5 +284,4 @@ def process_orientation_pair(
         f"FLAGGED {n_flagged_bg} as background (kept, not discarded)"
     )
     return n_saved, n_flagged_bg
-
 ```

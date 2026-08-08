@@ -4,7 +4,7 @@ from PIL import Image # Python Imaging Library, used here to create and save PNG
 
 def save_npy(arr, path):
     """
-    [Function 12: Called via pipeline_core.py:162, originating from main script preprocess_2d.py:262]
+    [Function 12: Called via pipeline_core.py:178, originating from main script preprocess_2d.py:266]
     Save a float32 2-D array as a .npy file.
     Parent directories are created automatically.
     """
@@ -21,7 +21,7 @@ def save_npy(arr, path):
 
 def save_preview_png(ct_arr, mri_arr, path):
     """
-    [Function 13: Called via pipeline_core.py:169, originating from main script preprocess_2d.py:262]
+    [Function 13: Called via pipeline_core.py:185, originating from main script preprocess_2d.py:266]
     Save a side-by-side CT | MRI comparison PNG for visual quality control.
     """
     # Ensure the parent directory (like 'previews/') exists before saving.

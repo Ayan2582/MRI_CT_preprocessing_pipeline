@@ -24,7 +24,11 @@ When you run `python preprocess_2d.py`, the `main()` function is triggered. Here
 This function handles the extraction of a single CT/MRI pair (like the Axial view of PA0).
 
 ### Step 1: Loading & N4 Correction
-It loads the DICOM folders using SimpleITK. Because MRI scanners have uneven magnetic fields, it immediately passes the MRI into `img_proc.apply_n4_bias_correction` (from `image_processing.py`) to fix the lighting.
+It loads the DICOM folders using SimpleITK. Because MRI receive coils are not uniformly sensitive across their field of view, it immediately passes the MRI into `img_proc.apply_n4_bias_correction` (from `image_processing.py`) to flatten the resulting shading.
+
+This runs on the **whole 3D volume at once**, and it has to happen here, first. Every step after it works one slice at a time, and once the stack has been taken apart the through-plane half of the bias field is no longer visible to anything. `orientation` is passed through because the B-spline mesh is anisotropic — lots of control points in-plane, the bare cubic minimum through-plane — and which anatomical direction each in-plane axis carries depends on the acquisition plane. See [`mri_pipeline_docs.md` §5](./mri_pipeline_docs.md).
+
+The relevant flag is `--n4_shrink` (default `4`). It is applied **in-plane only** — the slice axis is never downsampled, because these stacks are only 15–24 slices deep.
 
 ### Step 2: Physical Grid Matching (The Alignment)
 This is where the magic happens.
@@ -35,9 +39,12 @@ This is where the magic happens.
 ### Step 3: Slicing to 2D
 It uses `img_proc.volume_to_slices` to shatter the 3D SimpleITK volumes into a list of 2D Numpy arrays.
 
+### Step 3.5: (Optional) Measure one shift for the whole stack
+If `--register_2d` was passed, `img_proc.estimate_volume_translation` slides the MRI over the CT — a whole pixel at a time, best normalised mutual information wins — on a handful of probe slices, and pools their answers into a **single** translation for the entire stack. It applies that shift only if the probes agree and it demonstrably improves NMI; otherwise the MRI is left exactly where its DICOM origin put it. One shift per stack rather than one per slice is what stops the MRI shearing through z. See `mri_pipeline_docs.md` §9.
+
 ### Step 4: Iterating over Slices (The `for` loop)
 For every matching 2D slice in the CT and MRI:
-1. **(Optional) Register**: If `--register_2d` was passed, `img_proc.register_2d_rigid` nudges the MRI slice to align with the CT slice via gradient descent.
+1. **(Optional) Shift**: If a stack-wide shift was accepted above, `img_proc.apply_translation` moves this MRI slice by it — the same shift for every slice.
 2. **Normalize**: It applies the Hounsfield Window to the CT (`norm.normalize_ct_slice`), and the Percentile Clipping to the MRI (`norm.normalize_mri_slice`), scaling both to `[0, 1]`.
 3. **Flag Background**: If `90%` of the slice is black air, it's tagged `is_background=True` in `metadata.csv` — but still saved. Slices near the FOV edge can carry a thin sliver of real anatomy, so nothing is silently discarded here; filtering (if wanted) is left to the GAN's dataloader.
 4. ~~**Crop & Pad**~~: **Removed.** The pipeline no longer crops. Slices are kept at their native post-resample size, and cropping is done by the GAN's dataloader instead — so you can change crop strategy or input resolution without re-running preprocessing.

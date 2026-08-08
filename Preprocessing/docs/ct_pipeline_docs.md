@@ -28,8 +28,8 @@ The CT path is also notably *shorter* than the MRI path: it skips N4 bias correc
         ├─ io_utils.discover_series(CT/<patient>/ST0)      ← Stage 1: Discovery
         │      └─ io_utils.load_dicom_series(SE*)          ← Stage 2: Loading
         │
-        ├─ region profile lookup (preprocess_2d.py:167)    ← Stage 3: Region config
-        ├─ strict-name pairing loop (preprocess_2d.py:226) ← Stage 4: Pairing
+        ├─ region profile lookup (preprocess_2d.py:178)    ← Stage 3: Region config
+        ├─ strict-name pairing loop (preprocess_2d.py:230) ← Stage 4: Pairing
         │
         └─ pipeline_core.process_orientation_pair()
                  │
@@ -48,7 +48,7 @@ The CT path is also notably *shorter* than the MRI path: it skips N4 bias correc
 
 ## 2. Stage 1 — Series Discovery
 
-**Code:** `io_utils.discover_series()` · called from `preprocess_2d.py:207`
+**Code:** `io_utils.discover_series()` · called from `preprocess_2d.py:211`
 
 The pipeline walks `Raw_data_mri_ct/Rawdata_dicom/CT/<patient_id>/ST0/` and iterates its `SE*` sub-folders in sorted order. Rules are identical to the MRI side:
 
@@ -70,9 +70,9 @@ Each surviving series becomes a dictionary:
 }
 ```
 
-Note that the CT patient list also **drives the outer loop** — `preprocess_2d.py:139` does `sorted(os.listdir(ct_root))`. A patient with an MRI but no CT folder is never even considered; a patient with a CT but no MRI is counted into `patients_skipped_mri` and skipped at `:190`.
+Note that the CT patient list also **drives the outer loop** — `preprocess_2d.py:145` does `sorted(os.listdir(ct_root))`. A patient with an MRI but no CT folder is never even considered; a patient with a CT but no MRI is counted into `patients_skipped_mri` and skipped at `:190`.
 
-> ⚠️ **The CT's `orientation` field is computed but never used.** Pairing keys on folder names, and the orientation of the resulting pair is taken from the **MRI** entry (`preprocess_2d.py:237`). A CT whose orientation resolves to `"unknown"` is still processed perfectly well, as long as its MRI partner resolved cleanly.
+> ⚠️ **The CT's `orientation` field is computed but never used.** Pairing keys on folder names, and the orientation of the resulting pair is taken from the **MRI** entry (`preprocess_2d.py:240`). A CT whose orientation resolves to `"unknown"` is still processed perfectly well, as long as its MRI partner resolved cleanly.
 
 ---
 
@@ -137,7 +137,7 @@ The **crop size column below is historical** — `REGION_PROFILES` no longer car
 
 ## 5. Stage 4 — CT ↔ MRI Pairing
 
-**Code:** `preprocess_2d.py:226–244`
+**Code:** `preprocess_2d.py:230–248`
 
 Iteration is driven by the **MRI** list; for each MRI series the code searches the CT list for a basename match on the pre-underscore token:
 
@@ -154,7 +154,7 @@ A CT series that no MRI matches is simply never processed.
 
 ## 6. Stage 5 — In-Plane Resampling ⭐ *defines the pair's geometry*
 
-**Code:** `image_processing.resample_inplane(ct_entry["image"], args.target_spacing, is_ct=True)` · `pipeline_core.py:86`
+**Code:** `image_processing.resample_inplane(ct_entry["image"], args.target_spacing, is_ct=True)` · `pipeline_core.py:94`
 
 This is the CT's most consequential stage — its output grid is handed to `resample_mri_to_ct_grid()` as the reference image, so it dictates the shape of **both** modalities.
 
@@ -175,7 +175,7 @@ new_nz = orig_nz                 # slice count unchanged
 
 ```python
 resampler.SetInterpolator(sitk.sitkLinear)
-resampler.SetDefaultPixelValue(-1024 if is_ct else 0)   # image_processing.py:139
+resampler.SetDefaultPixelValue(-1024 if is_ct else 0)   # image_processing.py:262
 ```
 
 Linear interpolation is applied to HU values directly — valid because HU is a linear physical scale (unlike, say, interpolating an already-windowed 8-bit image). The `is_ct=True` branch fills any newly created border with **−1024 HU, i.e. air**, so padding is physically correct rather than an artificial "water-density" halo that a `0` fill would produce.
@@ -186,17 +186,17 @@ Linear interpolation is applied to HU values directly — valid because HU is a 
 
 ## 7. Stage 6 — Volume → Slices
 
-**Code:** `image_processing.volume_to_slices()` · `pipeline_core.py:98`
+**Code:** `image_processing.volume_to_slices()` · `pipeline_core.py:106`
 
 `sitk.GetArrayFromImage()` converts ITK `(x, y, z)` ordering to NumPy `(z, y, x)`, and the list comprehension yields one `(y, x)` array per slice.
 
-`n_pair = len(ct_slices)` at `pipeline_core.py:103` is the loop bound for the entire per-slice stage — and it is taken from the **CT**. This is safe only because Stage 5 of the MRI path resampled the MRI onto this exact grid, guaranteeing identical slice counts.
+`n_pair = len(ct_slices)` at `pipeline_core.py:111` is the loop bound for the entire per-slice stage — and it is taken from the **CT**. This is safe only because Stage 5 of the MRI path resampled the MRI onto this exact grid, guaranteeing identical slice counts.
 
 ---
 
 ## 8. Stage 7 — HU Windowing & Normalisation ⭐ *CT-only*
 
-**Code:** `normalization.normalize_ct_slice()` · `pipeline_core.py:134`
+**Code:** `normalization.normalize_ct_slice()` · `pipeline_core.py:142`
 
 ```python
 s = np.clip(slice_2d.astype(np.float32), window_min, window_max)
@@ -217,7 +217,7 @@ Unlike the MRI path there is no divide-by-zero guard — none is needed, since `
 
 ## 9. Stage 8 — Background Flagging
 
-**Code:** `normalization.is_background_slice()` · `pipeline_core.py:144–149`
+**Code:** `normalization.is_background_slice()` · `pipeline_core.py:152–154`
 
 ```python
 np.mean(arr <= 0.02) > 0.90
@@ -278,7 +278,7 @@ Two consequences — both now inherited by the dataloader, which is where they m
 
 ## 11. Stage 10 — Export
 
-**Code:** `export_utils.save_npy()` / `save_preview_png()` · `pipeline_core.py:162–172`
+**Code:** `export_utils.save_npy()` / `save_preview_png()` · `pipeline_core.py:178–186`
 
 ```
 <output_dir>/<patient_id>/<orientation>/ct/ct_<CTSERIES>_mri_<MRISERIES>_<idx:03d>.npy
@@ -301,9 +301,9 @@ ct_npy, mri_npy
 
 `height` / `width` are the actual saved dimensions.
 
-`body_region` is re-derived from the patient prefix at `pipeline_core.py:176–177` — use it to stratify train/val/test splits, since a random split across a 45-patient, 10-region dataset will otherwise leak anatomy between folds.
+`body_region` is re-derived from the patient prefix at `pipeline_core.py:192–193` — use it to stratify train/val/test splits, since a random split across a 45-patient, 10-region dataset will otherwise leak anatomy between folds.
 
-> ℹ️ There is **no `ct_desc` column.** The CT `series_desc` is read and logged but never written to the CSV, so the acquisition protocol (contrast/no-contrast, bone/soft kernel) does not survive into the processed dataset. Add it to the `metadata_rows` dict and to `fieldnames` in `preprocess_2d.py:282` if you need it.
+> ℹ️ There is **no `ct_desc` column.** The CT `series_desc` is read and logged but never written to the CSV, so the acquisition protocol (contrast/no-contrast, bone/soft kernel) does not survive into the processed dataset. Add it to the `metadata_rows` dict and to `fieldnames` in `preprocess_2d.py:286` if you need it.
 
 ---
 
@@ -348,7 +348,7 @@ CT-relevant flags: `--target_spacing` (effective), `--bg_thresh`, `--bg_fraction
 
 | Stage | CT | MRI |
 |---|---|---|
-| Bias correction | ✗ not needed | ✓ N4, 2D slice-by-slice |
+| Bias correction | ✗ not needed | ✓ N4, one 3D fit over the whole volume |
 | Resampling | `resample_inplane()` → **defines the grid** | `resample_mri_to_ct_grid()` → **inherits the grid** |
 | Padding fill (resample) | `−1024` HU (air) | `0.0` |
 | Intensity scale | Absolute (Hounsfield Units) | Arbitrary, scanner/sequence-dependent |

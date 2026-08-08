@@ -1082,14 +1082,34 @@ values in different parts of the image, smearing the joint histogram.
 `apply_n4_bias_correction` (in `image_processing.py`) fits a smooth multiplicative field and
 divides it out. Implementation notes worth knowing:
 
-- It runs **slice by slice in 2D**, not on the 3D volume, which suits this data's thick,
-  non-uniformly spaced slices.
+> **Changed 2026-08-08.** This function used to run slice by slice in 2D. It now fits one field
+> to the whole 3D volume. The notes below describe the current behaviour; see
+> [`mri_pipeline_docs.md` §5](./mri_pipeline_docs.md) for the full reasoning.
+
+- It runs on the **whole 3D volume**, because the coil sensitivity profile that causes the bias
+  field is one continuous function over the bore and does not restart at slice boundaries. Fitting
+  a separate 2D field per slice gave every slice its own free brightness scale, which manufactured
+  slice-to-slice steps — precisely the kind of brightness drift this section says N4 exists to
+  remove. The old justification was that thick, non-uniformly spaced slices make a 3D fit
+  unstable; the fix for that is an **anisotropic** mesh, not a 2D one. The through-plane axis gets
+  4 control points — the fewest a cubic spline can have, one span across the slab — so there is no
+  through-plane freedom left to destabilise. (The non-uniform spacing worry is also CT-only:
+  `data_known_issues_docs.md` §3 measured every MRI series as exactly uniform, and N4 only ever
+  touches MRI.)
+- **In-plane control points are derived per series** from its physical field of view, targeting a
+  fixed 25–35 mm spacing rather than a fixed count, so a 180 mm knee and a 400 mm abdomen get the
+  same field stiffness. The targets differ per acquisition plane because which anatomical
+  direction each in-plane axis carries depends on it.
 - It uses **Otsu thresholding** to build a tissue mask, so the fit is not dragged around by air.
-- It **shrinks by 4×** before fitting. The bias field is smooth by definition, so it is
+  The mask is computed on the volume, not per slice — a nearly-empty slice has no bimodal
+  histogram, and a per-slice Otsu on one calls its own noise "tissue".
+- It **shrinks by 4× in-plane** before fitting. The bias field is smooth by definition, so it is
   perfectly well estimated at low resolution — and the fit is ~16× faster. The estimated field is
-  then expanded back to full size and applied to the full-resolution slice.
-- It restores `Origin`/`Direction` explicitly before `JoinSeries`, because SimpleITK refuses to
-  stack slices whose physical metadata disagrees in the last decimal place.
+  a smooth analytic B-spline, so evaluating it back on the full-resolution grid is exact rather
+  than an upsample. The **slice axis is never shrunk**: these stacks are 15–24 slices, and
+  shrinking z by 4 would leave fewer samples than the through-plane spline has control points.
+- It no longer needs the `JoinSeries` `Origin`/`Direction` workaround, because the volume is never
+  disassembled in the first place.
 
 ### Example — what a bias field does to the joint histogram
 
@@ -1148,7 +1168,7 @@ Three problems:
   object. The `SetDirection` on the next line therefore mutates the caller's image in place.
   Anything else holding that MRI silently gets a corrupted one. The demo scripts defend against
   this by handing it a disposable copy — `img_proc.resample_mri_to_ct_grid(sitk.Image(mri_corrected), …)` —
-  but `pipeline_core.py:92` passes `mri_corrected` directly, so in production the N4-corrected
+  but `pipeline_core.py:100` passes `mri_corrected` directly, so in production the N4-corrected
   volume really is mutated in place.
 - **(b) destroys real information.** The MRI's `Direction` matrix is a measurement of how the
   patient was actually oriented. Overwriting it with the CT's does not *align* anything — it just
@@ -1955,7 +1975,7 @@ larger sample.
 | `registration_demo_spine_axes.py` | Multi-axis landscape sweep showing what the anchor does and does not fix |
 
 **None of these are part of the production pipeline.** They are diagnostics and reference
-implementations. Production (`pipeline_core.py:92`) still calls the broken
+implementations. Production (`pipeline_core.py:100`) still calls the broken
 `resample_mri_to_ct_grid` described in §7.3, followed by `register_2d_rigid` at line 130 —
 single-shot, multi-threaded, no multi-start, no scale gate, no fallback ladder. **Porting the v2
 alignment and the v3 selection logic into `image_processing.py` is outstanding work, not a

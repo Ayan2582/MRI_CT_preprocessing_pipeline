@@ -11,7 +11,7 @@ import numpy as np # Used for fast numerical matrix operations, which is essenti
 
 def normalize_ct_slice(slice_2d, window_min=-200.0, window_max=300.0):
     """
-    [Function 8: Called via pipeline_core.py:134, originating from main script preprocess_2d.py:262]
+    [Function 8: Called via pipeline_core.py:142, originating from main script preprocess_2d.py:266]
     Apply a soft-tissue HU window and normalise a CT slice to [0.0, 1.0].
     """
     # np.clip forces all pixel values below window_min to become window_min, and all values above window_max to become window_max.
@@ -28,7 +28,7 @@ def normalize_ct_slice(slice_2d, window_min=-200.0, window_max=300.0):
 
 def compute_mri_percentiles(volume_arr, p_low=0.5, p_high=99.5):
     """
-    [Function 7: Called via pipeline_core.py:110, originating from main script preprocess_2d.py:262]
+    [Function 7: Called via pipeline_core.py:118, originating from main script preprocess_2d.py:266]
     Compute robust intensity bounds for MRI normalisation using percentiles
     computed on the non-zero voxels of the entire volume.
     """
@@ -54,7 +54,7 @@ def compute_mri_percentiles(volume_arr, p_low=0.5, p_high=99.5):
 
 def normalize_mri_slice(slice_2d, p1, p99):
     """
-    [Function 9: Called via pipeline_core.py:135, originating from main script preprocess_2d.py:262]
+    [Function 9: Called via pipeline_core.py:143, originating from main script preprocess_2d.py:266]
     Clip an MRI slice to [p1, p99] and normalise to [0.0, 1.0].
     """
     # Calculate the total range between the bright and dark tissue percentiles.
@@ -74,7 +74,7 @@ def normalize_mri_slice(slice_2d, p1, p99):
 
 def is_background_slice(arr, intensity_thresh=0.02, bg_fraction=0.90):
     """
-    [Function 10: Called via pipeline_core.py:144-149, originating from main script preprocess_2d.py:262]
+    [Function 10: Called via pipeline_core.py:152-154, originating from main script preprocess_2d.py:266]
     Return True if the 2-D slice is predominantly background (uninformative).
     """
     # arr <= intensity_thresh creates a True/False mask where all dark pixels (below 0.02) are True.
@@ -84,5 +84,4 @@ def is_background_slice(arr, intensity_thresh=0.02, bg_fraction=0.90):
     # the slice as "is_background" in the metadata CSV rather than dropping it, so a
     # slice with a thin sliver of real anatomy near the FOV edge is never silently lost.
     return float(np.mean(arr <= intensity_thresh)) > bg_fraction
-
 ```

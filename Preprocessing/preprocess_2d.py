@@ -23,7 +23,7 @@ import pipeline_core # Our custom module containing the massive image processing
 
 def setup_logging(output_dir: str) -> logging.Logger:
     """
-    [Function 0.1: Used in the main pipeline at preprocess_2d.py:108]
+    [Function 0.1: Used in the main pipeline at preprocess_2d.py:112]
     Configure root logger to write to both console and pipeline.log.
     """
     # Safely create the output directory so the log file has a place to live.
@@ -52,7 +52,7 @@ def setup_logging(output_dir: str) -> logging.Logger:
 
 def parse_args() -> argparse.Namespace:
     """
-    [Function 0.2: Used in the main pipeline at preprocess_2d.py:105]
+    [Function 0.2: Used in the main pipeline at preprocess_2d.py:109]
     Parse command-line arguments to override default configuration settings.
     """
     p = argparse.ArgumentParser(
@@ -73,7 +73,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ct_win_max",     type=float, default=cfg.CT_WINDOW_MAX_HU,
                    help="CT window upper bound (HU)")
     p.add_argument("--register_2d",    action="store_true",
-                   help="Perform 2D Rigid Registration on slices to fix patient movement")
+                   help="Measure one in-plane translation per CT/MRI stack and apply it to "
+                        "every slice, to take out any offset the DICOM origins got wrong. "
+                        "Method: registration_idea.py")
+    p.add_argument("--reg_search_mm",  type=float, default=cfg.REG_SEARCH_MM,
+                   help="Registration searches +/- this many mm on each axis. Cost is "
+                        "quadratic in it. Only used with --register_2d")
     p.add_argument("--mri_p_low",      type=float, default=cfg.MRI_PERCENTILE_LOW,
                    help="MRI lower percentile for clipping")
     p.add_argument("--mri_p_high",     type=float, default=cfg.MRI_PERCENTILE_HIGH,
@@ -86,8 +91,9 @@ def parse_args() -> argparse.Namespace:
                    help="Save side-by-side CT|MRI PNG previews")
     p.add_argument("--skip_existing",  action="store_true", default=cfg.SKIP_EXISTING,
                    help="Skip patients whose output directory already exists")
-    p.add_argument("--n4_shrink",      type=int,   default=4,
-                   help="N4 bias correction shrink factor (1=full-res, 4=fast default)")
+    p.add_argument("--n4_shrink",      type=int,   default=cfg.N4_SHRINK_FACTOR,
+                   help="N4 in-plane shrink factor (1=full-res, 4=fast default). "
+                        "Never applied through-plane — see image_processing.py")
     p.add_argument("--patient",        default=None,
                    help="Process only this patient ID (for debugging)")
                    
@@ -117,7 +123,26 @@ def main():
     log.info(f"  CT window       : [{args.ct_win_min}, {args.ct_win_max}] HU -> [0, 1]")
     log.info(f"  MRI percentiles : [{args.mri_p_low}, {args.mri_p_high}]  -> [0, 1]")
     log.info(f"  BG filter       : thresh={args.bg_thresh}, fraction={args.bg_fraction}")
-    log.info(f"  N4 bias corr.   : MRI only, shrink_factor={args.n4_shrink}")
+    log.info(f"  N4 bias corr.   : MRI only, 3D volume fit, in-plane shrink={args.n4_shrink}")
+    log.info(f"                    spline order {cfg.N4_SPLINE_ORDER}, "
+             f"{cfg.N4_FITTING_LEVELS} fitting level(s) x {cfg.N4_ITERATIONS} iters")
+    log.info(f"                    through-plane control points: {cfg.N4_CONTROL_POINTS_THROUGH_PLANE} (fixed)")
+    for _o in cfg.ORIENTATIONS:
+        _t = cfg.N4_CONTROL_POINT_SPACING_MM.get(_o, cfg.N4_CONTROL_POINT_SPACING_MM["default"])
+        log.info(f"                    in-plane target spacing [{_o:8s}]: {_t[0]:.0f} x {_t[1]:.0f} mm "
+                 f"(counts derived per series from its FOV)")
+    if args.register_2d:
+        log.info(f"  Registration    : ON - one whole-pixel in-plane shift per stack, "
+                 f"applied to every slice")
+        log.info(f"                    search +/-{args.reg_search_mm:.0f} mm, "
+                 f"stride {cfg.REG_COARSE_MM:.0f} mm then fine around the best {cfg.REG_KEEP}, "
+                 f"{cfg.REG_BINS} bins")
+        log.info(f"                    estimated on {cfg.REG_N_PROBES} probe slices; needs "
+                 f">={cfg.REG_MIN_PROBES} to agree within {cfg.REG_MAX_SPREAD_MM:.0f} mm "
+                 f"and to gain >{cfg.REG_MIN_GAIN:.3f} NMI")
+    else:
+        log.info(f"  Registration    : OFF - MRI stays where its DICOM origin puts it "
+                 f"(--register_2d to enable)")
     log.info(f"  Save PNG        : {args.save_png}")
     log.info("=" * 65)
 
@@ -280,6 +305,7 @@ def main():
         "ct_series", "mri_series", "mri_desc",
         "height", "width",
         "ct_npy", "mri_npy", "is_background",
+        "reg_applied", "reg_dx_mm", "reg_dy_mm", "reg_nmi_gain", "reg_note",
     ]
     with open(meta_path, "w", newline="", encoding="utf-8") as f:
         # DictWriter converts our Python list-of-dictionaries directly into an Excel-style CSV sheet.
