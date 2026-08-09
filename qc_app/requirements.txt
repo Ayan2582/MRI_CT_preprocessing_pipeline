@@ -1,0 +1,17 @@
+# Dependencies for the QC tool AND the pipeline it drives.
+#
+# The first four are the existing pipeline's own requirements - qc_app adds
+# only FastAPI and uvicorn. Versions are the ones this was built and tested
+# against; the lower bounds are what the code actually needs.
+
+SimpleITK>=2.3          # DICOM series reading, N4, resampling  (tested 2.5.5)
+numpy>=1.24,<2          # every array in the pipeline            (tested 1.26.4)
+Pillow>=10.0            # PNG previews and the browser views     (tested 10.4.0)
+pydicom>=2.4            # registration_idea.py's command line    (tested 3.0.2)
+
+fastapi>=0.110          # the JSON API                           (tested 0.141.1)
+uvicorn>=0.27           # the ASGI server                        (tested 0.40.0)
+
+# No frontend build step. The UI is three static files served from
+# qc_app/static and uses no external JS or CSS.
+# SQLite comes from the Python standard library.

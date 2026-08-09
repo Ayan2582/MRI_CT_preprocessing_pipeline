@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CT / MRI Registration QC</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="ident">
+    <div class="ident-main">
+      <span id="id-patient" class="patient">—</span>
+      <span class="sep">/</span>
+      <span id="id-series" class="series">—</span>
+      <span class="sep">/</span>
+      <span id="id-image" class="image">—</span>
+    </div>
+    <div class="ident-sub">
+      <span id="id-orientation">—</span>
+      <span id="id-region" class="chip chip-quiet">—</span>
+      <span id="id-bg" class="chip chip-warn hidden">background</span>
+      <span id="id-status" class="chip">pending</span>
+    </div>
+  </div>
+
+  <div class="progress">
+    <div class="progress-nums">
+      <span id="pos">0</span><span class="dim"> / </span><span id="total">0</span>
+    </div>
+    <div class="progress-track"><div id="progress-fill" class="progress-fill"></div></div>
+    <div class="tallies">
+      <span class="tally tally-ok">accepted <b id="c-accepted">0</b></span>
+      <span class="tally tally-no">rejected <b id="c-rejected">0</b></span>
+      <span class="tally">pending <b id="c-pending">0</b></span>
+      <span class="tally tally-err">errors <b id="c-errors">0</b></span>
+    </div>
+  </div>
+
+  <div class="worker">
+    <div id="worker-dot" class="dot"></div>
+    <div class="worker-text">
+      <div id="worker-state">idle</div>
+      <div id="worker-detail" class="dim small">—</div>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+
+  <aside class="sidebar">
+    <div class="side-section">
+      <label class="lbl" for="filter">Filter</label>
+      <select id="filter">
+        <option value="all">All pairs</option>
+        <option value="pending">Pending</option>
+        <option value="accepted">Accepted</option>
+        <option value="rejected">Rejected</option>
+        <option value="error">Errors</option>
+        <option value="nudged">Manually nudged</option>
+        <option value="erased">Has erase strokes</option>
+      </select>
+    </div>
+
+    <div class="side-section">
+      <label class="lbl" for="search">Search</label>
+      <input id="search" type="search" placeholder="patient, series, file…" autocomplete="off" />
+    </div>
+
+    <div class="side-section">
+      <label class="lbl" for="jump">Jump to pair</label>
+      <div class="row">
+        <input id="jump" type="number" min="1" placeholder="1" />
+        <button id="jump-go" class="btn btn-quiet">Go</button>
+      </div>
+    </div>
+
+    <div class="side-section grow">
+      <div class="lbl lbl-row">
+        <span>Pairs</span><span id="list-count" class="dim">—</span>
+      </div>
+      <ul id="pair-list" class="pair-list"></ul>
+    </div>
+
+    <div class="side-section">
+      <div class="lbl">Dataset</div>
+      <div class="row">
+        <button id="btn-rescan" class="btn btn-quiet" title="Detect newly added patients">Rescan</button>
+        <button id="btn-export" class="btn btn-quiet" title="Rebuild metadata.csv">Export CSV</button>
+      </div>
+      <button id="btn-retry" class="btn btn-quiet wide">Retry failed series</button>
+      <button id="btn-reexport" class="btn btn-quiet wide"
+              title="Rewrite accepted .npy files whose edits came after acceptance">Re-export edited</button>
+      <div class="row">
+        <input id="wide-search-mm" type="number" min="10" max="200" step="10" value="90"
+               title="Search half-width in mm" />
+        <button id="btn-rerun-rejected" class="btn btn-quiet"
+                title="Re-measure series that ended with no shift, using a wider search">Re-run rejected</button>
+      </div>
+      <div id="problems" class="problems"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+
+    <section class="panes">
+      <figure class="pane">
+        <figcaption>CT <span class="dim" id="cap-ct"></span></figcaption>
+        <canvas id="cv-ct" class="viewer"></canvas>
+      </figure>
+      <figure class="pane">
+        <figcaption>MRI <span class="dim" id="cap-mri"></span></figcaption>
+        <canvas id="cv-mri" class="viewer"></canvas>
+      </figure>
+    </section>
+
+    <section class="result">
+      <div class="result-head">
+        <div class="tabs" id="view-tabs">
+          <button class="tab tab-on" data-view="overlay">Overlay</button>
+          <button class="tab" data-view="fusion">Fusion</button>
+          <button class="tab" data-view="checker">Checker</button>
+          <button class="tab" data-view="difference">Difference</button>
+        </div>
+        <div class="result-tools">
+          <label class="inline" id="alpha-wrap">
+            <span class="dim small">MRI</span>
+            <input id="alpha" type="range" min="0" max="100" value="50" />
+            <span id="alpha-val" class="dim small tnum">50%</span>
+          </label>
+          <label class="inline">
+            <input id="show-before" type="checkbox" />
+            <span class="small">Show unregistered</span>
+          </label>
+          <label class="inline" title="Pan and zoom all three views together (L)">
+            <input id="link-views" type="checkbox" checked />
+            <span class="small">Link views</span>
+          </label>
+          <button id="btn-fit" class="btn btn-quiet small">Fit</button>
+        </div>
+      </div>
+      <div id="nudge-bar" class="brush-bar hidden">
+        <span class="lbl">Nudge</span>
+        <select id="nudge-target" title="Only the relative offset is stored">
+          <option value="mri">move MRI</option>
+          <option value="ct">move CT</option>
+        </select>
+        <div class="pad-grid">
+          <button data-dx="0"  data-dy="1"  title="move up">↑</button>
+          <button data-dx="-1" data-dy="0"  title="move left">←</button>
+          <button data-dx="1"  data-dy="0"  title="move right">→</button>
+          <button data-dx="0"  data-dy="-1" title="move down">↓</button>
+        </div>
+        <label class="inline">
+          <span class="dim small">step</span>
+          <input id="nudge-step" type="number" min="1" max="20" value="1" />
+          <span class="dim small">mm</span>
+        </label>
+        <span id="nudge-val" class="dim small tnum">manual 0, 0 mm</span>
+        <span id="nudge-total" class="dim small tnum">—</span>
+        <button id="nudge-reset" class="btn btn-quiet small">Reset slice</button>
+        <button id="nudge-all" class="btn btn-quiet small"
+                title="Copy this slice's offset to every slice in the series">Apply to series</button>
+        <span class="dim small">this slice only · Shift+arrows · does not change the measured shift</span>
+      </div>
+
+      <div id="crop-target-bar" class="brush-bar hidden">
+        <span class="lbl">Crop</span>
+        <select id="crop-target">
+          <option value="pair">both (metric + shared)</option>
+          <option value="ct">CT export only</option>
+          <option value="mri">MRI export only</option>
+        </select>
+        <span id="crop-rects" class="dim small tnum">—</span>
+        <button id="crop-clear-ct" class="btn btn-quiet small">Clear CT rect</button>
+        <button id="crop-clear-roi" class="btn btn-quiet small">Clear metric ROI</button>
+        <button id="crop-clear-mri" class="btn btn-quiet small">Clear MRI rect</button>
+        <label class="inline" title="Apply the next crop to every slice in this series">
+          <input id="crop-to-series" type="checkbox" />
+          <span class="small">apply to series</span>
+        </label>
+        <label class="inline" title="Give the next slice the same box, ready to adjust">
+          <input id="crop-carry" type="checkbox" checked />
+          <span class="small">carry forward</span>
+        </label>
+        <span class="dim small">this slice only · drag to select · Esc to cancel</span>
+      </div>
+
+      <div id="brush-bar" class="brush-bar hidden">
+        <span class="lbl">Erase</span>
+        <label class="inline">
+          <span class="dim small">size</span>
+          <input id="brush-size" type="range" min="2" max="60" value="10" />
+          <span id="brush-size-val" class="dim small tnum">10 mm</span>
+        </label>
+        <button id="brush-undo" class="btn btn-quiet small">Undo</button>
+        <button id="brush-clear" class="btn btn-quiet small">Clear slice</button>
+        <label class="inline" title="Remove thin table rails and cradle from every slice of this series">
+          <input id="auto-erase" type="checkbox" />
+          <span class="small">Auto-remove rails (series)</span>
+        </label>
+        <button id="brush-all" class="btn btn-quiet small"
+                title="Copy this slice's erased region to every slice in the series">Apply to series</button>
+        <span class="dim small">scroll to zoom · middle-drag to pan · Alt+scroll or [ ] for brush size</span>
+      </div>
+      <div class="result-body">
+        <div class="result-canvas-wrap">
+          <canvas id="cv-result" class="viewer viewer-lg"></canvas>
+          <canvas id="cv-brush" class="brush-cursor"></canvas>
+          <div id="not-ready" class="not-ready hidden">
+            <div class="spinner"></div>
+            <div id="not-ready-text">Registering this series…</div>
+          </div>
+        </div>
+        <figure class="crop-pane">
+          <figcaption>CROP <span class="dim" id="cap-crop"></span></figcaption>
+          <canvas id="cv-crop" class="viewer viewer-static"></canvas>
+        </figure>
+      </div>
+    </section>
+
+    <section class="metrics">
+      <div class="metric-grid">
+        <div class="metric"><span class="mk">Shift applied</span><span class="mv" id="m-applied">—</span></div>
+        <div class="metric"><span class="mk">dx / dy</span><span class="mv tnum" id="m-shift">—</span></div>
+        <div class="metric"><span class="mk">NMI gain</span><span class="mv tnum" id="m-gain">—</span></div>
+        <div class="metric"><span class="mk">Probe spread</span><span class="mv tnum" id="m-spread">—</span></div>
+        <div class="metric"><span class="mk">Probes usable</span><span class="mv tnum" id="m-probes">—</span></div>
+        <div class="metric"><span class="mk">Search range</span><span class="mv tnum" id="m-search">—</span></div>
+        <div class="metric"><span class="mk">Metric ROI</span><span class="mv tnum" id="m-roi">full frame</span></div>
+        <div class="metric"><span class="mk">CT window</span><span class="mv tnum" id="m-window">—</span></div>
+      </div>
+      <p id="m-reason" class="reason">—</p>
+      <p id="m-error" class="error-box hidden"></p>
+    </section>
+
+    <section class="actions">
+      <button id="btn-accept" class="btn btn-accept">Accept <kbd>A</kbd></button>
+      <button id="btn-reject" class="btn btn-reject">Reject <kbd>R</kbd></button>
+      <button id="btn-crop"   class="btn">Crop region <kbd>C</kbd></button>
+      <button id="btn-erase"  class="btn">Erase <kbd>E</kbd></button>
+      <button id="btn-nudge"  class="btn">Nudge <kbd>N</kbd></button>
+      <button id="btn-rerun"  class="btn">Re-run</button>
+      <div class="spacer"></div>
+      <button id="btn-prev" class="btn btn-quiet">← Prev</button>
+      <button id="btn-next" class="btn btn-quiet">Next <kbd>→</kbd></button>
+      <div class="menu">
+        <button id="btn-series" class="btn btn-quiet">Whole series ▾</button>
+        <div id="series-menu" class="menu-pop hidden">
+          <button data-decision="ACCEPTED">Accept every slice</button>
+          <button data-decision="REJECTED">Reject every slice</button>
+          <button data-decision="PENDING">Reset every slice</button>
+          <hr />
+          <label class="inline pad">
+            <input id="crop-export" type="checkbox" />
+            <span class="small">Export cropped to ROI</span>
+          </label>
+          <button id="btn-clear-roi">Clear ROI &amp; re-run</button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

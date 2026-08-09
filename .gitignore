@@ -1,3 +1,10 @@
 /Raw_data_mri_ct
 /.claude
 *.png
+
+# QC tool workspace: manifest, slice cache and generated outputs. All
+# regenerable from the dataset, and the cache alone runs to ~700 MB.
+/qc_workspace
+__pycache__/
+*.pyc
+*.json

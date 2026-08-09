@@ -1,8 +1,16 @@
 """
 sweep_idea.py — registration_idea over every candidate.
 
-The same 11 region x orientation pairs and the same first/middle/last positions
-as sweep_og.py and registration_demo_sweep_v3.py, so all three CSVs line up.
+The 11 region x orientation pairs listed in ORIENTATION_CANDIDATES below, at
+first/middle/last positions in each stack.
+
+This is the only registration harness left in the repository. The optimiser-
+based scripts it used to be compared against (registration_demo*.py,
+registration_og.py, sweep_og.py, working_regis.py) implemented a DIFFERENT
+method - ITK rigid/affine multi-start with scale gates and crop fallbacks - and
+were removed once registration_idea became the production method. Their CSVs
+are still under registration_demo_output/ and the numbers quoted below are
+theirs; the scripts that produced them are recoverable from git history.
 
     python sweep_idea.py
 
@@ -30,8 +38,8 @@ Two columns matter more than the scores:
 There is no rotation, scale or shear column because there is no rotation, scale
 or shear. A whole-pixel slide cannot express them.
 
-SLICE PAIRING — same caveat as sweep_og
-───────────────────────────────────────
+SLICE PAIRING — a caveat of this 2D harness only
+────────────────────────────────────────────────
 A 2D method has no shared world origin, so CT slice z is paired with the MRI
 slice at the same fractional depth. That assumes both stacks cover the same
 anatomy end to end. Where they do not, the pair is wrong and no registration
@@ -49,10 +57,27 @@ import matplotlib.pyplot as plt
 
 import io_utils
 import pipeline_config as cfg
-import registration_demo_sweep as sweep
 import registration_idea as idea
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "registration_demo_output", "sweep_idea_2")
+
+# The eleven series this sweep measures: four body regions across all three
+# acquisition planes, chosen to span the range of offsets in the dataset.
+# Inlined here when the old demo/optimiser scripts were removed - this was the
+# only thing they still provided, and it is data, not method.
+ORIENTATION_CANDIDATES = [
+    {"region": "brain",    "patient": "PA0_Ranjeet",      "orientation": "axial",    "ct_se": "SE0", "mri_se": "SE0"},
+    {"region": "brain",    "patient": "PA0_Ranjeet",      "orientation": "coronal",  "ct_se": "SE1", "mri_se": "SE1"},
+    {"region": "brain",    "patient": "PA0_Ranjeet",      "orientation": "sagittal", "ct_se": "SE2", "mri_se": "SE2"},
+    {"region": "shoulder", "patient": "PA6_Vijay",        "orientation": "axial",    "ct_se": "SE0", "mri_se": "SE0"},
+    {"region": "shoulder", "patient": "PA6_Vijay",        "orientation": "coronal",  "ct_se": "SE1", "mri_se": "SE1"},
+    {"region": "shoulder", "patient": "PA6_Vijay",        "orientation": "sagittal", "ct_se": "SE2", "mri_se": "SE2"},
+    {"region": "spine",    "patient": "PA18_Sangeeta",    "orientation": "sagittal", "ct_se": "SE0", "mri_se": "SE0"},
+    {"region": "spine",    "patient": "PA18_Sangeeta",    "orientation": "coronal",  "ct_se": "SE1", "mri_se": "SE1"},
+    {"region": "knee",     "patient": "PA32_Mandbi_knee", "orientation": "axial",    "ct_se": "SE3", "mri_se": "SE3"},
+    {"region": "knee",     "patient": "PA32_Mandbi_knee", "orientation": "sagittal", "ct_se": "SE4", "mri_se": "SE4"},
+    {"region": "knee",     "patient": "PA32_Mandbi_knee", "orientation": "coronal",  "ct_se": "SE5", "mri_se": "SE5"},
+]
 COARSE = 4       # stride of the first sweep, mm. Verified against a full search on
 KEEP = 5         # 3 slices: identical NMI and identical shift, ~13x fewer positions.
 # +/- mm on each axis. (2*90+1)^2 = 32761 shifts per slice. Raised from 60 after
@@ -246,7 +271,7 @@ def main(only=None):
     print(f"  a full search would be {full} positions per slice\n")
 
     rows = []
-    for cand in sweep.ORIENTATION_CANDIDATES:
+    for cand in ORIENTATION_CANDIDATES:
         process_volume(cand, rows)
 
     csv_path = os.path.join(OUTPUT_DIR, "sweep_idea_2_summary.csv")
