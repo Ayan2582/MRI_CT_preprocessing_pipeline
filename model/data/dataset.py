@@ -94,10 +94,15 @@ class PairedSliceDataset(Dataset):
     hflip       : horizontal flip augmentation, train only
     """
 
+    ROI_MODES = ("none", "crop", "mask")
+
     def __init__(self, manifest, root, mode="train", crop_size=256,
-                 pad_multiple=256, hflip=True, num_downs=8):
+                 pad_multiple=256, hflip=True, num_downs=8, use_roi="none"):
         if mode not in ("train", "val", "test"):
             raise ValueError(f"mode must be train/val/test, got {mode!r}")
+        if use_roi not in self.ROI_MODES:
+            raise ValueError(f"data.use_roi must be one of {self.ROI_MODES}, "
+                             f"got {use_roi!r}")
 
         self.df = manifest.reset_index(drop=True)
         self.root = os.path.abspath(root)
@@ -105,6 +110,16 @@ class PairedSliceDataset(Dataset):
         self.crop_size = int(crop_size)
         self.hflip = bool(hflip) and mode == "train"
         self.num_downs = int(num_downs)
+        self.use_roi = use_roi
+
+        if self.use_roi != "none":
+            missing = [c for c in ("roi_x", "roi_y", "roi_w", "roi_h")
+                       if c not in self.df.columns]
+            if missing:
+                raise ValueError(
+                    f"data.use_roi='{use_roi}' needs {missing} in the manifest. "
+                    f"Regenerate it: python model/scripts/make_split.py --force"
+                )
 
         # The U-Net halves the resolution num_downs times, so every side must be
         # divisible by 2**num_downs. Enforcing it here turns a confusing shape
@@ -120,11 +135,32 @@ class PairedSliceDataset(Dataset):
         if len(self.df) == 0:
             raise ValueError(f"PairedSliceDataset('{mode}') got an empty manifest.")
 
-        logger.info("dataset[%s]: %d pairs, %d patients", mode, len(self.df),
-                    self.df["patient_id"].nunique())
+        logger.info("dataset[%s]: %d pairs, %d patients, use_roi=%s", mode,
+                    len(self.df), self.df["patient_id"].nunique(), self.use_roi)
 
     def __len__(self):
         return len(self.df)
+
+    def _roi_rect(self, row, shape):
+        """
+        The reviewer's ROI as integer pixel bounds, clipped to the image.
+
+        roi_mode is 'metric' throughout this dataset and the pipeline resamples
+        to 1 mm/pixel, so millimetres and pixels are the same number and the
+        stored values need no conversion.
+        """
+        h, w = shape
+        x0 = max(0, int(round(float(row["roi_x"]))))
+        y0 = max(0, int(round(float(row["roi_y"]))))
+        x1 = min(w, int(round(float(row["roi_x"]) + float(row["roi_w"]))))
+        y1 = min(h, int(round(float(row["roi_y"]) + float(row["roi_h"]))))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            # Degenerate box — fall back to the whole frame rather than hand
+            # back an 8-pixel image that would fail padding in a confusing way.
+            logger.warning("degenerate ROI (%d,%d)-(%d,%d) for %s; using full frame",
+                           x0, y0, x1, y1, row.get("ct_path"))
+            return 0, 0, w, h
+        return x0, y0, x1, y1
 
     def _load(self, rel_path):
         path = os.path.join(self.root, rel_path.replace("/", os.sep))
@@ -153,13 +189,48 @@ class PairedSliceDataset(Dataset):
                 f"{row['ct_series']}): MRI {mri.shape} vs CT {ct.shape}"
             )
 
+        # ── Region of interest ───────────────────────────────────────────────
+        # The QC reviewer drew a box around the anatomy, deliberately excluding
+        # the scanner table rails — thin bright near-vertical lines that appear
+        # in the CT and have no counterpart in the MRI. Left in, they teach the
+        # model that "black at the frame edge in MRI" maps to "bright vertical
+        # line in CT", and it duly synthesises rails into the air around the
+        # patient. Measured over training slices, 87% carry some bright content
+        # outside the box.
+        #
+        #   crop  physically discard everything outside the box. The rails never
+        #         reach the generator OR the discriminator. Strongest, and the
+        #         reason the box was drawn.
+        #   mask  keep the frame, zero both modalities outside the box and mark
+        #         those pixels invalid so they leave no gradient and score in no
+        #         metric. Keeps geometry, but the generator's output there is
+        #         then unconstrained rather than correct.
+        # `valid` starts as all-ones over the original pixels and travels through
+        # every geometric step alongside the images, so whatever ends up in the
+        # returned mask is the truth about which output pixels are real.
+        valid = np.ones_like(mri, dtype=np.float32)
+
+        if self.use_roi != "none":
+            x0, y0, x1, y1 = self._roi_rect(row, mri.shape)
+            if self.use_roi == "crop":
+                sl = (slice(y0, y1), slice(x0, x1))
+                mri, ct, valid = mri[sl], ct[sl], valid[sl]
+            else:
+                keep = np.zeros_like(mri, dtype=np.float32)
+                keep[y0:y1, x0:x1] = 1.0
+                mri, ct, valid = mri * keep, ct * keep, valid * keep
+            mri, ct, valid = (np.ascontiguousarray(a, dtype=np.float32)
+                              for a in (mri, ct, valid))
+
         if self.mode == "train":
             # Pad only where the slice is smaller than the crop (180x180 exists);
             # larger slices are left alone and the crop samples inside them.
             target_h = max(self.crop_size, mri.shape[0])
             target_w = max(self.crop_size, mri.shape[1])
-            mri, mask = _pad_to(mri, target_h, target_w)
+            mri, pad_mask = _pad_to(mri, target_h, target_w)
             ct, _ = _pad_to(ct, target_h, target_w)
+            valid, _ = _pad_to(valid, target_h, target_w)
+            mask = pad_mask * valid
 
             # One crop origin for both modalities. The pair is already only
             # approximately registered; cropping them independently would add a
@@ -176,8 +247,10 @@ class PairedSliceDataset(Dataset):
         else:
             target_h = _ceil_multiple(mri.shape[0], self.pad_multiple)
             target_w = _ceil_multiple(mri.shape[1], self.pad_multiple)
-            mri, mask = _pad_to(mri, target_h, target_w)
+            mri, pad_mask = _pad_to(mri, target_h, target_w)
             ct, _ = _pad_to(ct, target_h, target_w)
+            valid, _ = _pad_to(valid, target_h, target_w)
+            mask = pad_mask * valid
 
         item = {
             # A = source (MRI), B = target (CT), following the pix2pix convention.
@@ -221,5 +294,6 @@ def build_datasets(cfg, manifest, split):
             pad_multiple=cfg.data.pad_multiple,
             hflip=cfg.data.get_path("augment.hflip", True),
             num_downs=cfg.model.generator.num_downs,
+            use_roi=cfg.data.get("use_roi", "none"),
         )
     return datasets

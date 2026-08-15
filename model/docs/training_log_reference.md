@@ -262,6 +262,8 @@ multiplying by 1.0 the whole time it warns. It would only matter if
 
 ## See also
 
+- `notebook_walkthrough.md` — the Kaggle notebook cell by cell, and what each run trained
+
 - `gan_evaluation_guide.md` — how to decide whether a run is better than another
 - `loss_function_guide.md` — the three loss terms and their λs
 - `training_strategies.md` — the objective variants and the six stabilisers

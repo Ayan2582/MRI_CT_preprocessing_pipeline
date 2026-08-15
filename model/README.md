@@ -45,6 +45,7 @@ python model/scripts/train.py --config exp2_paper.yaml --set loss.lambda_nce=0
 | document | read it for |
 |---|---|
 | **[gan_evaluation_guide.md](docs/gan_evaluation_guide.md)** | **how to tell whether your GAN is improving** — start here |
+| [notebook_walkthrough.md](docs/notebook_walkthrough.md) | **what the Kaggle notebook does, cell by cell** — and exactly what trained |
 | [training_log_reference.md](docs/training_log_reference.md) | **every number the trainer prints**, and its healthy range |
 | [loss_function_guide.md](docs/loss_function_guide.md) | what each term does, what each λ changes |
 | [training_strategies.md](docs/training_strategies.md) | objective variants, and the six stabilisers |

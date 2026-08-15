@@ -28,6 +28,28 @@ data:
   pad_multiple: 256          # validation pads up to a multiple of this
   drop_background: true      # the 23 slices flagged is_background in metadata.csv
 
+  # Use the ROI box the QC reviewer drew around the anatomy.
+  #
+  # WHY IT MATTERS. The boxes were drawn to exclude the scanner table rails —
+  # thin bright near-vertical lines present in the CT with no counterpart in the
+  # MRI. Left in, the training pair says "black at the frame edge in MRI" maps
+  # to "bright vertical line in CT", and the model duly synthesises rails into
+  # the air beside the patient. 87% of training slices carry some bright content
+  # outside the box; the reviewer's manual erase brush was only applied to 406
+  # of 1687, so most rails survived into training.
+  #
+  #   none  ignore the box. What exp1_pix2pix ran with.
+  #   crop  discard everything outside it. Rails never reach the generator or
+  #         the discriminator. Recommended.
+  #   mask  keep the frame but zero outside the box and mark it invalid, so it
+  #         contributes no gradient and no metric. Preserves geometry, but the
+  #         generator's output there is unconstrained rather than correct.
+  #
+  # Median ROI is 209x220 px, so 77% need padding back up to a 256 crop. That is
+  # the same zero-padding path the 180x180 slices already take, and the validity
+  # mask keeps it out of every loss and metric.
+  use_roi: none
+
   augment:
     hflip: true              # applied identically to MRI and CT
     # Rotation/scaling are deliberately NOT offered. Manual QC corrected

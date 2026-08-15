@@ -300,6 +300,8 @@ discriminator is built at all.
 
 ## See also
 
+- `notebook_walkthrough.md` — the Kaggle notebook cell by cell, and what each run trained
+
 - `gan_evaluation_guide.md` — how to tell whether it is working
 - `loss_function_guide.md` — the three terms and their λs
 - `training_strategies.md` — objective variants and the six stabilisers
