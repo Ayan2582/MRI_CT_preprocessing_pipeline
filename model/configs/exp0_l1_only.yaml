@@ -1,0 +1,25 @@
+# exp0 — L1-only regression floor.
+#
+# Question it answers: is the adversarial term earning its keep at all?
+#
+# No discriminator is built and no D forward pass runs, so this is a plain
+# supervised U-Net regression. Its validation MAE is the floor every GAN run
+# must beat to justify its existence. If exp1 does not beat this on mae_norm,
+# the GAN is adding cost and hallucination risk for nothing.
+#
+# Expect: the best MAE of any run, and visibly the blurriest images. That
+# combination is the whole reason pix2pix exists — see docs/gan_evaluation_guide.md
+# on why MAE alone must not pick your final model.
+
+_base_: base.yaml
+
+run:
+  name: exp0_l1_only
+
+loss:
+  lambda_gan: 0.0
+  lambda_l1: 100.0
+  lambda_nce: 0.0
+
+train:
+  gan_warmup_epochs: 0        # nothing to warm up to

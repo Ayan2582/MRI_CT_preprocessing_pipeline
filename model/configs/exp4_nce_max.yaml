@@ -1,0 +1,25 @@
+# exp4 — how far can the L1 anchor be released before the model starts inventing?
+#
+# Question it answers: where is the hallucination boundary?
+#
+# With lambda_l1 down at 10, the pixel-fidelity anchor is weak and the model is
+# free to synthesise whatever texture the discriminator finds convincing. Expect
+# the sharpest, most CT-looking output of any run in this ladder — and read that
+# with suspicion rather than satisfaction.
+#
+# This is the run where dice_bone and mae_band_bone matter most. A model can
+# improve on SSIM and global MAE while fabricating or erasing bone, because bone
+# is a small fraction of the pixels. If dice_bone drops relative to exp3 while
+# the images look better, the extra sharpness is invention, not accuracy.
+#
+# Not a candidate for deployment. It exists to locate the edge of the safe range.
+
+_base_: base.yaml
+
+run:
+  name: exp4_nce_max
+
+loss:
+  lambda_gan: 1.0
+  lambda_l1: 10.0
+  lambda_nce: 5.0

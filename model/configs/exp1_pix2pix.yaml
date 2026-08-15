@@ -1,0 +1,18 @@
+# exp1 — plain pix2pix.
+#
+# Question it answers: what does the standard, published recipe give on this
+# dataset? This is the baseline every other run is compared against.
+#
+# Identical to Isola et al. 2017 in loss terms (cGAN + 100*L1), with the
+# stabilisers from base.yaml on top — those are concessions to a 2184-image
+# dataset, not deviations from the method.
+
+_base_: base.yaml
+
+run:
+  name: exp1_pix2pix
+
+loss:
+  lambda_gan: 1.0
+  lambda_l1: 100.0
+  lambda_nce: 0.0

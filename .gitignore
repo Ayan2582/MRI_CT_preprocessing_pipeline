@@ -8,3 +8,14 @@
 __pycache__/
 *.pyc
 *.json
+
+# Training runs: checkpoints, logs, sample panels. Large and regenerable.
+/model/runs
+# Packaged copy of the dataset for upload; ~1.5 GB.
+/model/kaggle_dataset
+
+# The split and manifest are the one pair of generated files that MUST be
+# tracked: every experiment has to train and validate on the same patients or
+# the runs are not comparable to each other. The `*.json` rule above would
+# otherwise swallow splits.json silently.
+!/model/data/splits.json

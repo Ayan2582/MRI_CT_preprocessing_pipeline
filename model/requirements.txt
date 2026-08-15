@@ -1,0 +1,16 @@
+# Training dependencies for the MRI → CT pix2pix + PatchNCE model.
+#
+# numpy is pinned <2 to match the rest of the repository (qc_app/requirements.txt);
+# SimpleITK and pydicom in the preprocessing environment are built against the
+# 1.x ABI, so relaxing it here would break the pipeline this model consumes.
+#
+# scikit-image is deliberately absent: SSIM is implemented in evaluation/metrics.py
+# in ~40 lines of torch, which avoids the dependency, runs on GPU, and keeps
+# validation batched instead of looping to numpy per-sample.
+
+numpy>=1.24,<2
+torch>=2.0
+torchvision>=0.15
+PyYAML>=6.0
+pandas>=2.0
+matplotlib>=3.7

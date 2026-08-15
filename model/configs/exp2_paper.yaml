@@ -1,0 +1,18 @@
+# exp2 — the target loss at textbook weights.
+#
+#   L_total = L_cGAN + 100 * L_L1 + 1 * L_PatchNCE
+#
+# lambda_l1 = 100 from pix2pix, lambda_nce = 1 from CUT (Park et al. 2020).
+# Neither number was tuned on paired medical data at this scale, so treat them
+# as a reference point rather than an optimum — exp3 tests one alternative
+# weighting, and this run is what it is measured against.
+
+_base_: base.yaml
+
+run:
+  name: exp2_paper
+
+loss:
+  lambda_gan: 1.0
+  lambda_l1: 100.0
+  lambda_nce: 1.0

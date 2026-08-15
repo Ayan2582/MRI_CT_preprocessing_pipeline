@@ -1,0 +1,30 @@
+# exp3 — lean on PatchNCE. An open question, not a favourite.
+#
+# Halves lambda_l1 and doubles lambda_nce relative to exp2, shifting weight from
+# pixel-exact agreement onto structural correspondence.
+#
+# WHAT THIS IS NOT. An earlier version of this file justified the reweighting by
+# the median 5.2 degree CT/MRI frame mismatch reported in
+# qc_app/registration_service.py:26-37. That justification was wrong: the 5.2
+# degrees describes the RAW frames, and every pair here then went through manual
+# QC — 129 rejected, 738 slices nudged individually, artifacts erased on 560. The
+# translation error that argument depended on was corrected by hand.
+#
+# WHAT MIGHT STILL MAKE IT WIN. In-plane rotation is not correctable by
+# translation and its residual here is unmeasured. Separately, a contrastive
+# term supplies structural signal that neither L1 nor a patch discriminator
+# provides, and 1687 training slices is few enough that the extra signal may
+# help on its own merits.
+#
+# Run it because the comparison is cheap and informative, not because it is
+# expected to win. If it does not beat exp2, that is a clean result.
+
+_base_: base.yaml
+
+run:
+  name: exp3_nce_heavy
+
+loss:
+  lambda_gan: 1.0
+  lambda_l1: 50.0
+  lambda_nce: 2.0

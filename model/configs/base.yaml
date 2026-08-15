@@ -1,0 +1,208 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# base.yaml — every knob this model has, with the reasoning behind each default.
+#
+# The experiment files (exp0..exp4) inherit from this via `_base_: base.yaml`
+# and declare only their deltas. Any key not declared here cannot be set from
+# the command line — `--set` rejects unknown paths on purpose, so a typo'd
+# override fails loudly instead of silently producing the wrong experiment.
+#
+# Override syntax:  --set loss.lambda_nce=0 train.batch_size=4
+# ─────────────────────────────────────────────────────────────────────────────
+
+run:
+  name: base                 # subdirectory under out_dir; keep unique per experiment
+  out_dir: model/runs
+  seed: 1337                 # seeds python/numpy/torch; the split has its own seed
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+data:
+  # Root that the manifest's relative paths hang off. On this machine that is
+  # the QC output folder; on Kaggle it becomes /kaggle/input/<dataset-name>.
+  # This single value is what makes the dataset portable — nothing else in the
+  # config or the manifest holds an absolute path.
+  root: qc_workspace/output
+  manifest: model/data/manifest.csv
+  splits: model/data/splits.json
+
+  crop_size: 256             # training crop; 1 px = 1 mm, so this is a 256 mm FOV
+  pad_multiple: 256          # validation pads up to a multiple of this
+  drop_background: true      # the 23 slices flagged is_background in metadata.csv
+
+  augment:
+    hflip: true              # applied identically to MRI and CT
+    # Rotation/scaling are deliberately NOT offered. Manual QC corrected
+    # translation on these pairs but could not correct in-plane rotation, so
+    # some unmeasured rotational residual remains; adding synthetic geometric
+    # jitter would pile more of the same error onto a target that already has
+    # some. Flips are safe because they are exact and applied to both modalities.
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+model:
+  generator:
+    type: unet
+    in_channels: 1
+    out_channels: 1
+    ngf: 64
+    num_downs: 8             # 8 downsamplings => 256x256 reaches a 1x1 bottleneck
+    norm: instance           # NOT batch: batch stats are noisy at small batch
+                             # sizes and leak between samples. Instance norm is
+                             # per-image, so a batch-2 CPU smoke test behaves
+                             # like the batch-8 Kaggle run.
+    dropout: true            # pix2pix has no noise vector z; bottleneck dropout
+                             # is the only stochasticity in the generator
+    dropout_at_eval: false   # OFF at eval so predictions are deterministic and
+                             # a rerun of evaluate.py reproduces its numbers
+
+  discriminator:
+    type: patchgan
+    n_layers: 3              # => 70x70 receptive field, the pix2pix default
+    ndf: 64
+    conditional: true        # D sees cat[MRI, CT] so it judges correspondence,
+                             # not just "does this look like a CT"
+
+# ── Loss ─────────────────────────────────────────────────────────────────────
+# L_total = lambda_gan * L_cGAN + lambda_l1 * L_L1 + lambda_nce * L_PatchNCE
+#
+# Setting a lambda to 0 removes that term's ENTIRE code path, not just its
+# contribution: lambda_gan=0 builds no discriminator and runs no D forward pass,
+# lambda_nce=0 builds no MLP heads and no third optimizer. So the ablations cost
+# less compute than the full model rather than the same.
+loss:
+  gan_mode: lsgan            # lsgan | vanilla | hinge
+                             # lsgan penalises how far a sample sits from the
+                             # decision boundary, so gradients never vanish the
+                             # way BCE's do once D starts winning.
+
+  lambda_gan: 1.0
+  lambda_l1: 100.0           # ~99% of gradient magnitude. L1 supplies the
+                             # anatomy; the GAN term only supplies texture.
+  lambda_nce: 1.0
+
+  nce:
+    # Tap indices into the generator encoder. Tap 0 is the input image itself;
+    # tap k is the output of encoder block k-1, at input_size / 2**k resolution.
+    #
+    # Deep taps are unusable, which is easy to get wrong: with num_downs=8 and a
+    # 256 crop the encoder reaches 1x1 at the bottleneck, and a 1x1 feature map
+    # has exactly one spatial location to sample from — not the 256 patches
+    # PatchNCE asks for. At a 256 crop these five taps give 65536 / 16384 / 4096
+    # / 1024 / 256 locations respectively, so tap 4 is already the practical
+    # floor. Going deeper silently degrades into sampling the same patch
+    # repeatedly rather than failing.
+    layers: [0, 1, 2, 3, 4]
+    num_patches: 256         # sampled locations per layer per image
+    temperature: 0.07
+    nce_dim: 256             # width of the projection MLP heads
+    use_mlp: true
+    nce_idt: false           # identity NCE on real CT. CUT needs it because it
+                             # has no L1 term; here L1 already covers it, and it
+                             # costs an extra full generator pass.
+
+# ── Stabilisers ──────────────────────────────────────────────────────────────
+# Each one fixes a specific, named failure mode. See docs/training_strategies.md.
+stabilizers:
+
+  # Failure: D wins so hard its output saturates and G receives no usable
+  # gradient direction. Spectral norm caps D's Lipschitz constant so it
+  # physically cannot become an infinitely confident classifier.
+  spectral_norm_d: true
+
+  # Failure: the two-player game oscillates, so epoch N+1 is not reliably better
+  # than epoch N and "which checkpoint do I ship" has no answer. An exponential
+  # moving average of G sits at the centre of the oscillation instead of at a
+  # random point on its orbit. Evaluated and checkpointed; never trained.
+  ema:
+    enabled: true
+    decay: 0.999
+    start_epoch: 1           # let G leave its random init before averaging
+
+  # Failure: with only ~1500 training slices, D memorises the training set and
+  # its feedback stops measuring realism. DiffAugment augments BOTH real and
+  # fake before D, differentiably, so there is nothing stable to memorise and G
+  # is never asked to produce augmented output.
+  diffaug:
+    enabled: true
+    policy: color,translation,cutout
+
+  # Failure: D drives its confidence toward infinity, which is what causes the
+  # saturation above. Training D toward 0.9 instead of 1.0 removes the incentive.
+  label_smoothing:
+    enabled: true
+    real_target: 0.9
+
+  # Failure: D still outpaces G. Handicap the stronger player with a lower
+  # learning rate. Off by default — reach for it when the curves show the
+  # problem, not pre-emptively.
+  ttur:
+    enabled: false
+    lr_d: 1.0e-4
+
+  # Failure: D memorises (as with DiffAugment) via sharp decision boundaries
+  # around individual training images. Penalising D's gradient at real samples
+  # forces smooth boundaries. Strong, but needs a second backward pass through D.
+  r1:
+    enabled: false
+    gamma: 10.0
+    every: 16                # lazy regularisation: apply every N D steps and
+                             # scale by N, which recovers most of the benefit
+                             # at a fraction of the cost
+
+# ── Training ─────────────────────────────────────────────────────────────────
+train:
+  n_epochs: 200              # ~273 iters/epoch at batch 8 => ~55k iterations
+  batch_size: 8
+  lr: 2.0e-4
+  beta1: 0.5                 # pix2pix convention; 0.9 makes GAN training lurch
+  beta2: 0.999
+
+  # Constant LR for the first half, then linear decay to zero over the second.
+  # The decay phase is where fine detail settles — cutting training short at the
+  # start of it gives noticeably worse samples than letting it finish.
+  lr_policy: linear_decay
+  lr_decay_start_frac: 0.5
+
+  # Train L1-only for the first N epochs so G produces something anatomically
+  # sane before D starts critiquing it. Cheap insurance against early collapse.
+  gan_warmup_epochs: 5
+
+  grad_clip: 0.0             # 0 disables
+
+# ── Evaluation ───────────────────────────────────────────────────────────────
+eval:
+  every: 1                   # validate every N epochs
+  batch_size: 1              # validation images are full-size and vary in size
+  selection_metric: mae_norm # the scalar that decides best.pt
+  selection_mode: min
+  use_ema: true              # rank epochs by the EMA generator, not the live one
+
+  bone_threshold_hu: 150.0
+  # Bone metrics are computed on non-brain slices only. The brain CT window is
+  # 0-80 HU, so every voxel above 80 HU — all bone — saturates to 1.0 and is
+  # indistinguishable from bright soft tissue. Scoring bone there would be
+  # measuring a constant. See docs/gan_evaluation_guide.md.
+  bone_metrics_exclude_regions: [brain]
+
+  hu_bands:                  # (name, lo_hu, hi_hu); clipped to each region's window
+    - [air,  -1000.0, -200.0]
+    - [soft,  -200.0,  150.0]
+    - [bone,   150.0,  3000.0]
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging:
+  print_every: 50            # iterations
+  sample_every: 5            # epochs between sample panels
+  # A fixed panel of validation slices, one per body region, rendered every
+  # sample_every epochs. Always the same slices, so visual progress is
+  # comparable across epochs and across runs instead of anecdotal.
+  n_sample_slices_per_region: 2
+  save_every: 1              # epochs between checkpoints; 1 because a Kaggle
+                             # session can be killed at any moment
+  keep_last_n: 3
+
+# ── Runtime ──────────────────────────────────────────────────────────────────
+runtime:
+  device: auto               # auto | cuda | cpu
+  num_workers: 4             # set 0 on Windows if dataloader workers misbehave
+  pin_memory: true
+  amp: true                  # mixed precision; ignored on CPU
+  channels_last: false
