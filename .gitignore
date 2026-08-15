@@ -19,3 +19,4 @@ __pycache__/
 # the runs are not comparable to each other. The `*.json` rule above would
 # otherwise swallow splits.json silently.
 !/model/data/splits.json
+/model/kaggle_code

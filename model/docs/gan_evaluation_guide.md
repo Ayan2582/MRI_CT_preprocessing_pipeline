@@ -364,6 +364,8 @@ Both "fixed" choices matter:
 
 ## See also
 
+- `training_log_reference.md` — decodes every field in the training log
+
 - `loss_function_guide.md` — what each term does and what each λ changes
 - `training_strategies.md` — the objective variants and all six stabilisers
 - `kaggle_workflow.md` — packaging, training, resuming

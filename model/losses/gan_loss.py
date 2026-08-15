@@ -94,18 +94,42 @@ class GANLoss(nn.Module):
         # rate relative to G, a mild handicap on the player that usually wins.
         loss = (loss_real + loss_fake) * 0.5
 
+        threshold = self.decision_threshold()
         stats = {
             "D_real": loss_real.detach(),
             "D_fake": loss_fake.detach(),
-            # Accuracy against the 0-crossing (lsgan/hinge) or 0.5 probability
-            # (vanilla, whose logit 0 is the same crossing). These two numbers
-            # are the primary health signal: see docs/gan_evaluation_guide.md.
-            "D_acc_real": (pred_real.detach() > 0).float().mean(),
-            "D_acc_fake": (pred_fake.detach() <= 0).float().mean(),
+            # Accuracy is only meaningful against the RIGHT boundary, which
+            # differs per objective — see decision_threshold(). Getting this
+            # wrong does not affect training (these are detached, log-only) but
+            # it makes a healthy discriminator look collapsed.
+            "D_acc_real": (pred_real.detach() > threshold).float().mean(),
+            "D_acc_fake": (pred_fake.detach() <= threshold).float().mean(),
             "D_score_real": pred_real.detach().mean(),
             "D_score_fake": pred_fake.detach().mean(),
         }
         return loss, stats
+
+    def decision_threshold(self):
+        """
+        The score above which D is calling a sample 'real'.
+
+        This is objective-dependent, and using 0 for everything is wrong:
+
+          lsgan    D REGRESSES toward real_target (0.9 with label smoothing,
+                   else 1.0) and fake_target (0.0). The boundary is the midpoint
+                   between them, ~0.45 — not zero. A healthy LSGAN D might score
+                   fakes at +0.35, comfortably on the fake side of 0.45, while a
+                   zero threshold would score that as 100% fooled and report
+                   D_acc_fake near 0.0 on a discriminator that is working fine.
+
+          hinge    Trained to push reals above +1 and fakes below -1, so zero is
+                   genuinely the midpoint.
+
+          vanilla  Raw logits; logit 0 is probability 0.5, the natural boundary.
+        """
+        if self.gan_mode == "lsgan":
+            return (self.real_target + self.fake_target) / 2.0
+        return 0.0
 
     def g_loss(self, pred_fake):
         """Generator's adversarial loss — G wants D to call its output real."""

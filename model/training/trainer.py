@@ -24,6 +24,7 @@ import logging
 import os
 import random
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -171,7 +172,18 @@ class Trainer:
 
             self.sched_G.step()
             if self.sched_D is not None:
-                self.sched_D.step()
+                # During GAN warm-up the discriminator optimizer is never
+                # stepped, so PyTorch warns that the scheduler ran first. The
+                # warning is correct but harmless here: D's learning rate is not
+                # consulted while D is frozen, and stepping its scheduler in
+                # lockstep with G's is what makes both reach lr=0 at n_epochs
+                # together. Suppressed rather than skipped, so the two schedules
+                # cannot drift apart by the length of the warm-up.
+                with warnings.catch_warnings():
+                    if not self.model.gan_active(epoch):
+                        warnings.filterwarnings(
+                            "ignore", message=r".*lr_scheduler\.step\(\).*")
+                    self.sched_D.step()
 
             self._log_epoch(record)
 
@@ -266,28 +278,56 @@ class Trainer:
     # ── Logging ──────────────────────────────────────────────────────────────
 
     def _log_epoch(self, record):
+        """
+        Append to the JSONL, then rebuild metrics.csv from it.
+
+        WHY REBUILD RATHER THAN APPEND. An earlier version froze the CSV header
+        from the first epoch's keys and appended thereafter. That silently lost
+        every GAN column for a whole 200-epoch run: epoch 0 is GAN warm-up, so
+        D_acc_real, D_acc_fake, D_total and G_GAN do not exist yet, the header
+        was written without them, and each later epoch's values were dropped on
+        the way out. Nothing complained — the CSV just had no D columns, and the
+        plotting cell drew an empty axis.
+
+        Rebuilding from the JSONL each epoch takes the union of all keys seen so
+        far, so a column that appears at epoch 5 is backfilled with blanks for
+        epochs 0-4 and populated from then on. At a few hundred epochs the cost
+        is microseconds, and the JSONL stays the authoritative record.
+        """
         with open(self.jsonl_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=float) + "\n")
 
-        # Flat scalars only; the nested per-region values live in the JSONL.
-        flat = {k: v for k, v in record.items()
-                if isinstance(v, (int, float, bool)) or v is None}
-        if self._csv_columns is None:
-            write_header = not os.path.exists(self.csv_path)
-            self._csv_columns = list(flat.keys())
-            if write_header:
-                with open(self.csv_path, "w", encoding="utf-8") as fh:
-                    fh.write(",".join(self._csv_columns) + "\n")
-            else:
-                # Resumed run: keep the existing header so the file stays one
-                # continuous table across sessions.
-                with open(self.csv_path, "r", encoding="utf-8") as fh:
-                    self._csv_columns = fh.readline().strip().split(",")
+        rows = []
+        with open(self.jsonl_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # A session killed mid-write can leave one truncated line.
+                    # Skip it rather than lose the whole history.
+                    logger.warning("skipping malformed line in %s", self.jsonl_path)
 
-        row = [("" if flat.get(c) is None else str(flat.get(c, "")))
-               for c in self._csv_columns]
-        with open(self.csv_path, "a", encoding="utf-8") as fh:
-            fh.write(",".join(row) + "\n")
+        # Flat scalars only; nested per-region values stay in the JSONL. Column
+        # order follows first appearance, so 'epoch' stays leftmost.
+        columns = []
+        for row in rows:
+            for key, value in row.items():
+                if (isinstance(value, (int, float, bool)) or value is None) \
+                        and key not in columns:
+                    columns.append(key)
+        self._csv_columns = columns
+
+        tmp = self.csv_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(",".join(columns) + "\n")
+            for row in rows:
+                fh.write(",".join(
+                    "" if row.get(c) is None else str(row.get(c, ""))
+                    for c in columns) + "\n")
+        os.replace(tmp, self.csv_path)
 
     # ── Samples ──────────────────────────────────────────────────────────────
 
