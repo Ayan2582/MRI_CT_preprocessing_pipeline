@@ -96,13 +96,34 @@ class PairedSliceDataset(Dataset):
 
     ROI_MODES = ("none", "crop", "mask")
 
+    @staticmethod
+    def normalise_roi_mode(value):
+        """
+        Accept the booleans as well as the three names.
+
+        `use_roi: true` is the spelling everyone reaches for first, and YAML
+        parses it as a bool rather than a string. Rejecting it would mean
+        discovering the mistake on Kaggle, after an upload — so true maps to
+        'crop' (the recommended mode) and false to 'none'.
+        """
+        if isinstance(value, bool):
+            return "crop" if value else "none"
+        value = str(value).strip().lower()
+        if value in ("true", "yes", "1"):
+            return "crop"
+        if value in ("false", "no", "0"):
+            return "none"
+        return value
+
     def __init__(self, manifest, root, mode="train", crop_size=256,
                  pad_multiple=256, hflip=True, num_downs=8, use_roi="none"):
         if mode not in ("train", "val", "test"):
             raise ValueError(f"mode must be train/val/test, got {mode!r}")
+        use_roi = self.normalise_roi_mode(use_roi)
         if use_roi not in self.ROI_MODES:
-            raise ValueError(f"data.use_roi must be one of {self.ROI_MODES}, "
-                             f"got {use_roi!r}")
+            raise ValueError(
+                f"data.use_roi must be one of {self.ROI_MODES} (or true/false, "
+                f"which map to 'crop'/'none'), got {use_roi!r}")
 
         self.df = manifest.reset_index(drop=True)
         self.root = os.path.abspath(root)

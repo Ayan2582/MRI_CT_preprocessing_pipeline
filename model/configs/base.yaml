@@ -48,10 +48,10 @@ data:
   # Median ROI is 209x220 px, so 77% need padding back up to a 256 crop. That is
   # the same zero-padding path the 180x180 slices already take, and the validity
   # mask keeps it out of every loss and metric.
-  use_roi: none
+  use_roi: true
 
   augment:
-    hflip: true              # applied identically to MRI and CT
+    hflip: false             # applied identically to MRI and CT
     # Rotation/scaling are deliberately NOT offered. Manual QC corrected
     # translation on these pairs but could not correct in-plane rotation, so
     # some unmeasured rotational residual remains; adding synthetic geometric
