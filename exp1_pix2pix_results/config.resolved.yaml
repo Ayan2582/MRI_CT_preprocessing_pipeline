@@ -1,0 +1,107 @@
+run:
+  name: exp1_pix2pix
+  out_dir: /kaggle/working/runs
+  seed: 1337
+data:
+  root: /kaggle/input/datasets/ayan102/mri-ct-paired-slices
+  manifest: /kaggle/input/datasets/ayan102/mri-ct-paired-slices/manifest.csv
+  splits: /kaggle/input/datasets/ayan102/mri-ct-paired-slices/splits.json
+  crop_size: 256
+  pad_multiple: 256
+  drop_background: true
+  augment:
+    hflip: true
+model:
+  generator:
+    type: unet
+    in_channels: 1
+    out_channels: 1
+    ngf: 64
+    num_downs: 8
+    norm: instance
+    dropout: true
+    dropout_at_eval: false
+  discriminator:
+    type: patchgan
+    n_layers: 3
+    ndf: 64
+    conditional: true
+loss:
+  gan_mode: lsgan
+  lambda_gan: 1.0
+  lambda_l1: 100.0
+  lambda_nce: 0.0
+  nce:
+    layers:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    num_patches: 256
+    temperature: 0.07
+    nce_dim: 256
+    use_mlp: true
+    nce_idt: false
+stabilizers:
+  spectral_norm_d: true
+  ema:
+    enabled: true
+    decay: 0.999
+    start_epoch: 1
+  diffaug:
+    enabled: true
+    policy: color,translation,cutout
+  label_smoothing:
+    enabled: true
+    real_target: 0.9
+  ttur:
+    enabled: false
+    lr_d: 0.0001
+  r1:
+    enabled: false
+    gamma: 10.0
+    every: 16
+train:
+  n_epochs: 200
+  batch_size: 8
+  lr: 0.0002
+  beta1: 0.5
+  beta2: 0.999
+  lr_policy: linear_decay
+  lr_decay_start_frac: 0.5
+  gan_warmup_epochs: 5
+  grad_clip: 0.0
+eval:
+  every: 1
+  batch_size: 1
+  selection_metric: mae_norm
+  selection_mode: min
+  use_ema: true
+  bone_threshold_hu: 150.0
+  bone_metrics_exclude_regions:
+  - brain
+  hu_bands:
+  - - air
+    - -1000.0
+    - -200.0
+  - - soft
+    - -200.0
+    - 150.0
+  - - bone
+    - 150.0
+    - 3000.0
+logging:
+  print_every: 50
+  sample_every: 5
+  n_sample_slices_per_region: 2
+  save_every: 1
+  keep_last_n: 3
+runtime:
+  device: auto
+  num_workers: 2
+  pin_memory: true
+  amp: true
+  channels_last: false
+_resolved_from: /kaggle/working/MRI_CT_preprocessing_pipeline/model/configs/exp1_pix2pix.yaml
+_hash: 47e03aded350

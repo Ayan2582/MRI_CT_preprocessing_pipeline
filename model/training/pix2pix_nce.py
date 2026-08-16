@@ -19,7 +19,17 @@ THE ORDER OF A STEP.
     2. D step            real and fake both through DiffAugment, then D.
                          Skipped during GAN warm-up and when lambda_gan == 0.
     3. G step            adversarial + L1 + PatchNCE, one backward
-    4. EMA update        shadow generator folds in the new weights
+    4. path-length step  StyleGAN2 only, and only every pl_every steps: a SECOND,
+                         separate optimisation of G. It needs a double backward,
+                         which is fragile and overflows in fp16 under autocast, so
+                         it runs unscaled in fp32 — and a scaled and an unscaled
+                         backward must not meet inside one GradScaler step.
+    5. EMA update        shadow generator folds in the new weights
+
+ARCHITECTURE IS A CONFIG CHOICE. netG and netD come from networks/builder.py,
+which dispatches on model.generator.type / model.discriminator.type. Nothing in
+this file knows whether it is driving a U-Net or a StyleGAN2 synthesis network —
+the tap protocol PatchNCE relies on is implemented by both.
 
 THE LAZY-OPTIMIZER GOTCHA. PatchSampleF's MLP heads cannot be built until a real
 tensor has passed through, because their input widths are the encoder's channel
@@ -30,15 +40,15 @@ step 0 and on any resume of a run whose first step has not completed.
 """
 
 import logging
+import math
 
 import torch
 import torch.nn as nn
 
 from ..losses.builder import build_losses, masked_l1
 from ..losses.gan_loss import r1_penalty
+from ..networks.builder import build_discriminator, build_generator
 from ..networks.patch_sampler import PatchSampleF
-from ..networks.patchgan import build_discriminator
-from ..networks.unet import build_generator
 from .diffaug import DiffAugment
 from .ema import ModelEMA
 
@@ -59,7 +69,10 @@ class Pix2PixNCEModel(nn.Module):
         self.netD = None
         if self.plan.use_gan:
             spectral = cfg.get_path("stabilizers.spectral_norm_d", True)
-            self.netD = build_discriminator(cfg.model, spectral).to(device)
+            # batch_size reaches the builder because StyleGAN2's minibatch-stddev
+            # layer groups the batch and needs a group size that divides it.
+            self.netD = build_discriminator(
+                cfg.model, spectral, int(cfg.train.batch_size)).to(device)
         else:
             logger.info("lambda_gan == 0: no discriminator built at all "
                         "(this run is a plain regression)")
@@ -112,6 +125,28 @@ class Pix2PixNCEModel(nn.Module):
         if self.r1_enabled:
             logger.info("R1 penalty enabled: gamma=%.1f, every %d D steps "
                         "(this D step runs in fp32)", self.r1_gamma, self.r1_every)
+
+        # ── Path-length regularization (StyleGAN2) ───────────────────────────
+        self.pl_enabled = bool(cfg.get_path("stabilizers.path_length.enabled", False))
+        self.pl_weight = float(cfg.get_path("stabilizers.path_length.weight", 2.0))
+        self.pl_every = int(cfg.get_path("stabilizers.path_length.every", 4))
+        self.pl_decay = float(cfg.get_path("stabilizers.path_length.decay", 0.01))
+        # Running mean of the path length, the moving target the penalty pulls
+        # toward. Training state, so it is checkpointed.
+        self.pl_mean = torch.zeros((), device=device)
+        if self.pl_enabled:
+            if not hasattr(self.netG, "synthesise_with_styles"):
+                raise ValueError(
+                    "stabilizers.path_length.enabled is true, but generator type "
+                    f"'{cfg.get_path('model.generator.type', 'unet')}' has no style "
+                    "vector to regularise. Path-length regularization measures how "
+                    "far the image moves per unit step in W, which only exists for "
+                    "a style-based generator. Set it false, or use "
+                    "model.generator.type: stylegan2."
+                )
+            logger.info("path-length regularization enabled: weight=%.1f, every %d "
+                        "G steps (those steps run in fp32, unscaled)",
+                        self.pl_weight, self.pl_every)
 
         self.warmup_epochs = int(cfg.get_path("train.gan_warmup_epochs", 0))
         self.grad_clip = float(cfg.get_path("train.grad_clip", 0.0))
@@ -199,6 +234,40 @@ class Pix2PixNCEModel(nn.Module):
         self._ensure_optimizer_F()
 
         return self.criteria["nce"](q_pool, k_pool, batch_size=source.size(0))
+
+    def path_length_penalty(self):
+        """
+        StyleGAN2's path-length regularization.
+
+        WHAT IT ASKS FOR. That a fixed-size step in W moves the image by a fixed
+        amount, everywhere in W — i.e. that the generator's mapping is well
+        conditioned rather than wildly sensitive in some directions and flat in
+        others. It is measured by pushing a random unit image-space direction back
+        through the Jacobian and comparing the resulting length against a running
+        mean of past lengths.
+
+        HOW IT DIFFERS FROM THE PAPER HERE. StyleGAN2 draws w from the mapping
+        network's Gaussian prior, so it has unlimited free samples. There is no
+        prior in a translation model — every w is the encoding of a real patient —
+        so the estimate comes from the batch that happens to be in flight, which
+        makes it noisier than the published version at these batch sizes.
+
+        Returns (penalty, mean_path_length) with the running mean already updated.
+        """
+        fake, ws = self.netG.synthesise_with_styles(self.real_A)
+
+        # Unit-norm random direction in image space, scaled so the expected
+        # magnitude is independent of resolution.
+        noise = torch.randn_like(fake) / math.sqrt(fake.shape[2] * fake.shape[3])
+        grad = torch.autograd.grad(outputs=(fake * noise).sum(), inputs=ws,
+                                   create_graph=True, only_inputs=True)[0]
+
+        lengths = grad.square().sum(dim=2).mean(dim=1).sqrt()
+        mean = self.pl_mean.lerp(lengths.detach().mean(), self.pl_decay)
+        with torch.no_grad():
+            self.pl_mean.copy_(mean)
+
+        return (lengths - mean).square().mean(), lengths.detach().mean()
 
     # ── Optimisation ─────────────────────────────────────────────────────────
 
@@ -302,6 +371,33 @@ class Pix2PixNCEModel(nn.Module):
             scaler.step(self.optimizer_F)
 
         stats["G_total"] = loss_G.detach()
+
+        # ── Path-length regularization, as its own optimisation step ─────────
+        # Lazy regularisation: applied every pl_every steps and scaled by that
+        # factor, which recovers most of the benefit at a fraction of the cost —
+        # the same trick R1 uses in backward_D.
+        #
+        # It is a SEPARATE step, not another term added to loss_G, for two
+        # reasons. It needs a double backward through G, which is fragile and
+        # overflows in fp16 under autocast, so it has to run unscaled in fp32 —
+        # and mixing a scaled and an unscaled backward into one GradScaler step is
+        # exactly where silent gradient corruption lives. Splitting it also
+        # matches the reference implementation, where regularisation is its own
+        # pass.
+        if self.pl_enabled and (self.global_step % self.pl_every == 0):
+            with torch.autocast(device_type=self.device.type, enabled=False):
+                penalty, length = self.path_length_penalty()
+                loss_pl = self.pl_weight * penalty * self.pl_every
+
+            self.optimizer_G.zero_grad(set_to_none=True)
+            loss_pl.backward()
+            if self.grad_clip > 0:
+                nn.utils.clip_grad_norm_(self.netG.parameters(), self.grad_clip)
+            self.optimizer_G.step()
+
+            stats["G_PL"] = penalty.detach()
+            stats["G_PL_len"] = length
+
         return stats
 
     def optimize_parameters(self, batch, epoch, scaler, amp_ctx):
@@ -383,6 +479,12 @@ class Pix2PixNCEModel(nn.Module):
             state["optimizer_F"] = self.optimizer_F.state_dict()
         if self.ema is not None:
             state["ema"] = self.ema.state_dict()
+        if self.pl_enabled:
+            # The running path length is training state, not a derived value: a
+            # resume that restarted it from zero would spend the first hundred
+            # steps regularising toward a target that is still warming up, and the
+            # bit-exact resume check in smoke_test.py would fail.
+            state["pl_mean"] = self.pl_mean.detach().cpu()
         return state
 
     def load_state_dict(self, state, strict=True):
@@ -412,6 +514,11 @@ class Pix2PixNCEModel(nn.Module):
 
         if self.ema is not None and "ema" in state:
             self.ema.load_state_dict(state["ema"])
+
+        # Absent when resuming a run that had path-length off, which is a normal
+        # thing to do — zero is the same value a fresh run starts from.
+        if self.pl_enabled and "pl_mean" in state:
+            self.pl_mean.copy_(state["pl_mean"].to(self.pl_mean.device))
         return self
 
 

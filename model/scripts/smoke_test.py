@@ -59,6 +59,37 @@ BASE_OVERRIDES = [
     "eval.every=1",
 ]
 
+# StyleGAN2 is sized by native_size rather than by ngf/num_downs, so it needs its
+# own shrink list. native_size=64 with const_size=4 is 4 downsamplings, which is
+# what num_downs must then declare — dataset.py reads it for the padding multiple
+# and the generator builder rejects a mismatch.
+STYLEGAN_OVERRIDES = [
+    "data.crop_size=64",
+    "data.pad_multiple=64",
+    "model.generator.num_downs=4",
+    "model.generator.native_size=64",
+    "model.generator.w_dim=64",
+    "model.generator.n_mapping=4",
+    "model.generator.channel_base=2048",
+    "model.generator.channel_max=64",
+    "model.generator.tile_stride=32",
+    "model.discriminator.channel_base=2048",
+    "model.discriminator.channel_max=64",
+    "model.discriminator.mbstd_group_size=2",
+    "loss.nce.layers=[0,1,2]",
+    "loss.nce.num_patches=64",
+    "loss.nce.nce_dim=32",
+    "train.batch_size=2",
+    "train.n_epochs=1",
+    "train.gan_warmup_epochs=0",   # exercise the D path in a one-epoch run
+    "runtime.num_workers=0",
+    "runtime.device=cpu",
+    "runtime.amp=false",
+    "logging.print_every=5",
+    "logging.sample_every=999",
+    "eval.every=1",
+]
+
 
 def _tiny_datasets(cfg, n_train=20, n_val=8):
     """Cut the real data down to a handful of slices, keeping region variety."""
@@ -185,6 +216,109 @@ def check_resume(out_root):
     return True
 
 
+def check_stylegan2(out_root):
+    """
+    The second architecture: structure, tiling, determinism, and initialisation.
+
+    Four of these five assertions guard failures that are SILENT — the run trains,
+    the loss goes down, and the damage only shows up as a worse number at the end
+    of a Kaggle session. They are worth the minute they cost.
+    """
+    log.info("─" * 70)
+    log.info("CHECK 4  StyleGAN2 architecture")
+
+    from model.networks.builder import build_generator
+    from model.networks.stylegan2 import EqualizedConv2d
+    from model.networks.tiling import tiled_forward
+    from model.training.pix2pix_nce import Pix2PixNCEModel
+
+    # ── 4a. Tiling reconstructs exactly ──────────────────────────────────────
+    # An identity "generator" must come back unchanged, which is true only if the
+    # raised-cosine weights sum to one at EVERY pixel — including the borders,
+    # where a textbook Hann window is zero and the normalisation would divide by
+    # zero. This is the cheapest possible test of the thing that lets 45% of the
+    # validation set be scored at all.
+    source = torch.randn(1, 1, 128, 128)
+    rebuilt = tiled_forward(lambda t: t, source, native=64, stride=32)
+    assert rebuilt.shape == source.shape, f"tiling changed shape: {rebuilt.shape}"
+    error = float((rebuilt - source).abs().max())
+    assert error < 1e-5, f"tiled identity is not the identity: max error {error:.2e}"
+    log.info("PASS  tiling: 128px through 64px windows, max error %.1e", error)
+
+    # ── 4b/4c. Both configs train, with the right structure ──────────────────
+    expectations = [
+        ("exp5_stylegan2_vanilla", "smoke_sg2_vanilla",
+         ["netG", "netD", "optimizer_D", "pl_mean"], ["netF", "optimizer_F"]),
+        ("exp6_stylegan2_fitted", "smoke_sg2_fitted",
+         ["netG", "netD", "netF", "optimizer_F"], ["pl_mean"]),
+    ]
+    for config, run_name, present, absent in expectations:
+        cfg = load_config(f"model/configs/{config}.yaml",
+                          STYLEGAN_OVERRIDES + [f"run.name={run_name}"])
+        _run(cfg, out_root)
+
+        state = torch.load(os.path.join(out_root, run_name, "checkpoints", "last.pt"),
+                           map_location="cpu", weights_only=False)["model"]
+        for key in present:
+            assert key in state, f"{config}: '{key}' missing from the checkpoint"
+        for key in absent:
+            assert key not in state, (
+                f"{config}: '{key}' is in the checkpoint, so that code path was "
+                f"built despite being switched off")
+        log.info("PASS  %-24s absent=%-22s nickname=%r", config,
+                 ",".join(absent), state["loss_plan"]["nickname"])
+
+    # exp5's objective must not have quietly acquired a reconstruction term.
+    cfg5 = load_config("model/configs/exp5_stylegan2_vanilla.yaml", STYLEGAN_OVERRIDES)
+    assert cfg5.loss.lambda_l1 == 0 and cfg5.loss.lambda_nce == 0, \
+        "exp5 is supposed to run StyleGAN2's own loss: adversarial only"
+
+    # ── 4d. Deterministic at eval ────────────────────────────────────────────
+    # Noise injection is resampled per call. If it survives into evaluation,
+    # mae_norm becomes a random variable and two runs of evaluate.py on one
+    # checkpoint disagree.
+    model = Pix2PixNCEModel(cfg5, torch.device("cpu"))
+    net = model.set_eval_mode(model.netG)
+    probe = torch.randn(1, 1, 64, 64)
+    with torch.no_grad():
+        first, second = net(probe), net(probe)
+    assert torch.equal(first, second), (
+        "the generator is not deterministic at eval — noise injection is still "
+        "live. Check model.generator.noise_at_eval and NoiseInjection.training.")
+    log.info("PASS  eval is deterministic (noise injection off)")
+
+    # ── 4e. Initialisation was not clobbered ─────────────────────────────────
+    # Equalized learning rate needs N(0,1) weights, scaled at runtime. If anything
+    # ever passes these modules through networks/init.py:init_weights they become
+    # N(0,0.02) AND runtime-scaled — roughly 50x too small — and the network trains
+    # happily while learning nothing at all. Nothing else would report it.
+    fresh = build_generator(cfg5.model.generator)
+    stds = [float(m.weight.detach().std()) for m in fresh.modules()
+            if isinstance(m, EqualizedConv2d)]
+    assert stds, "no EqualizedConv2d found; did the generator type change?"
+    worst = min(stds)
+    assert worst > 0.5, (
+        f"StyleGAN2 conv weights have std {worst:.4f}, expected ~1.0. Something "
+        f"applied init_weights (N(0,0.02)) to an equalized-LR module.")
+    log.info("PASS  equalized-LR init intact (%d convs, min std %.3f)",
+             len(stds), worst)
+
+    # ── 4f. Warm-up with no reconstruction term is refused ───────────────────
+    try:
+        load_and_plan = load_config("model/configs/exp5_stylegan2_vanilla.yaml",
+                                    STYLEGAN_OVERRIDES + ["train.gan_warmup_epochs=3"])
+        from model.losses.builder import LossPlan
+        LossPlan(load_and_plan)
+    except ValueError:
+        log.info("PASS  warm-up without L1/NCE is refused at config time")
+    else:
+        raise AssertionError(
+            "gan_warmup_epochs>0 with lambda_l1=0 and lambda_nce=0 should raise: "
+            "the warm-up epochs would have no loss at all")
+
+    return True
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="CPU smoke test for the model wiring")
     parser.add_argument("--quick", action="store_true", help="wiring check only")
@@ -202,7 +336,7 @@ def main(argv=None):
     try:
         checks = [check_wiring]
         if not args.quick:
-            checks += [check_modularity, check_resume]
+            checks += [check_modularity, check_resume, check_stylegan2]
         for check in checks:
             check(out_root)
 

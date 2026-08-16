@@ -26,12 +26,32 @@ report for it. Seeing `D_*` and `G_GAN` appear at epoch 5 is the warm-up ending.
 | `G_L1` | mean abs. error vs the real CT, normalised units, padding excluded | ↓ |
 | `G_GAN` | how convincingly D was fooled this batch | see below |
 | `G_NCE` | PatchNCE loss, mean over tapped layers (absent when λ_NCE = 0) | ↓ slowly |
+| `G_PL` | path-length penalty, StyleGAN2 runs only (absent unless enabled) | ↓ slowly |
+| `G_PL_len` | the raw path length the penalty is pulling toward its running mean | settles |
 | `G_total` | `λ_GAN·G_GAN + λ_L1·G_L1 + λ_NCE·G_NCE` | ↓ |
+
+**A field is absent, not zero, when its term is off.** `exp5_stylegan2_vanilla`
+writes no `G_L1` and no `G_NCE` at all, because λ_L1 = λ_NCE = 0 removes those
+code paths rather than multiplying them by zero. If you are diffing two runs'
+columns, a missing column is the objective differing, not a logging bug.
 
 **`G_total` is dominated by L1.** With λ_L1 = 100 and G_L1 = 0.188, the L1 term
 contributes 18.8 of a 19.1 total — 98%. `G_total` is essentially `100 × G_L1`
 with a rounding error attached, so watching it tells you almost nothing that
 `G_L1` doesn't. Watch the components.
+
+**On `exp5_stylegan2_vanilla`, `G_total` *is* `G_GAN`.** There is nothing else in
+that objective, so for once the total is worth reading directly — and `mae_norm`
+in the validation table is a quantity the run never optimises. Expect it to be
+poor and do not read that as a bug; see the ladder table in the README.
+
+**`G_PL` has no published healthy range for this setting.** Path-length
+regularization was characterised on unconditional face synthesis at 1024 px with
+`w` drawn from a Gaussian prior. Here `w` is a real patient's encoding and the
+penalty is estimated from the batch in flight, so the magnitude is not comparable
+to anything in the literature. Watch `G_PL_len` for stabilisation rather than
+`G_PL` for a target value: a path length that keeps climbing means the map is
+getting more ill-conditioned, not better.
 
 **`G_GAN` is not a quality score.** It measures G's performance against a
 discriminator that changes every step. It falling can mean G improved *or* D got
@@ -228,6 +248,14 @@ the model has started producing genuine bone rather than a uniform grey.
 | images sharp, `dice_bone` falling | hallucination | raise `lambda_l1` |
 | `val/mae_norm` bounces wildly epoch to epoch | not using EMA | `eval.use_ema=true` |
 | `G_NCE` flat from the start | NCE taps too deep | shallower `loss.nce.layers` |
+| `G_GAN` flatlines on exp5/exp6 | R1 γ too high — D over-smoothed | `stabilizers.r1.gamma` — see below |
+| exp5/exp6 samples look like plausible CT of the *wrong* anatomy | no encoder→decoder skips; the only route from MRI to output is the global `w` | expected for this architecture; compare against exp2 rather than tuning |
+| a visible seam down a large abdomen slice | tiled inference — each 256 window gets its own `w` | lower `model.generator.tile_stride` for more overlap |
+
+**On R1 γ for the StyleGAN2 runs.** `base.yaml` ships `gamma: 10.0`, StyleGAN2's
+FFHQ-1024 value. The heuristic is `γ = 0.0002 · N² / M`, so at 256 px it is 3.3 at
+batch 4 and 1.6 at batch 8 — which is what exp5 and exp6 set. Too high and D stops
+discriminating, which looks exactly like the GAN not helping.
 | `nan` anywhere | AMP + exploding gradient | `runtime.amp=false` to confirm, then `train.grad_clip=1.0` |
 
 ---

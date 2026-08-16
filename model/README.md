@@ -57,16 +57,33 @@ python model/scripts/train.py --config exp2_paper.yaml --set loss.lambda_nce=0
 
 Run in order. Each answers exactly one question; each is one config file.
 
-| # | config | λ_GAN | λ_L1 | λ_NCE | question |
-|---|---|---|---|---|---|
-| 0 | `exp0_l1_only` | 0 | 100 | 0 | is the GAN earning its keep at all? |
-| 1 | `exp1_pix2pix` | 1 | 100 | 0 | what does the standard recipe give? |
-| 2 | `exp2_paper` | 1 | 100 | 1 | the target loss, textbook weights |
-| 3 | `exp3_nce_heavy` | 1 | 50 | 2 | lean on NCE — open question |
-| 4 | `exp4_nce_max` | 1 | 10 | 5 | where does hallucination start? |
+| # | config | λ_GAN | λ_L1 | λ_NCE | architecture | question |
+|---|---|---|---|---|---|---|
+| 0 | `exp0_l1_only` | 0 | 100 | 0 | U-Net + PatchGAN | is the GAN earning its keep at all? |
+| 1 | `exp1_pix2pix` | 1 | 100 | 0 | U-Net + PatchGAN | what does the standard recipe give? |
+| 2 | `exp2_paper` | 1 | 100 | 1 | U-Net + PatchGAN | the target loss, textbook weights |
+| 3 | `exp3_nce_heavy` | 1 | 50 | 2 | U-Net + PatchGAN | lean on NCE — open question |
+| 4 | `exp4_nce_max` | 1 | 10 | 5 | U-Net + PatchGAN | where does hallucination start? |
+| 5 | `exp5_stylegan2_vanilla` | 1 | **0** | **0** | StyleGAN2 | what does StyleGAN2's *own* loss give? |
+| 6 | `exp6_stylegan2_fitted` | 1 | 100 | 1 | StyleGAN2 | does the architecture beat the U-Net? |
 
-`exp0` is the floor. If the GAN runs don't beat it on anything but sharpness,
-you are paying compute and hallucination risk for a cosmetic change.
+**0–4 vary the objective on one fixed architecture. 5 and 6 do the opposite.**
+
+`exp0` is the floor and `exp5` is the ceiling — the same experiment run from
+opposite ends. exp0 is a regression with no adversary; exp5 is StyleGAN2's
+adversarial objective with no reconstruction term at all. Neither is a candidate:
+if the GAN runs don't beat exp0 on anything but sharpness you are paying compute
+and hallucination risk for a cosmetic change, and exp5 exists to show how much of
+the texture is coming from the adversary alone.
+
+**exp5 will score badly on `mae_norm`, and that is the expected result.** With
+λ_L1 = 0 the only thing tying the synthesised CT to the input MRI is the
+conditional discriminator seeing `cat[MRI, CT]` — pix2pix-without-L1, which the
+pix2pix paper itself ablates and reports as substantially worse. Read exp5 for
+texture and stability, exp6 for accuracy.
+
+**exp6 is the one to compare against exp2.** Identical λs, identical data, split
+and seed — so the only thing that moved is the architecture.
 
 ---
 
@@ -124,9 +141,10 @@ correct source.
 
 ```
 model/
-├── configs/          base.yaml + the five experiments (deltas only)
+├── configs/          base.yaml + the seven experiments (deltas only)
 ├── data/             manifest, subject-level split, PairedSliceDataset
-├── networks/         U-Net with tappable encoder, PatchGAN, PatchSampleF
+├── networks/         builder (type dispatch), U-Net with tappable encoder,
+│                     PatchGAN, StyleGAN2 G+D, PatchSampleF, tiled inference
 ├── losses/           GAN variants, PatchNCE, the loss plan
 ├── training/         composite model, trainer, EMA, DiffAugment
 ├── evaluation/       region-aware metrics, run comparison
@@ -134,6 +152,16 @@ model/
 ├── notebooks/        kaggle_train.ipynb
 └── docs/             the four guides above
 ```
+
+`networks/builder.py` is the only module that knows more than one architecture
+exists; `unet.py` and `patchgan.py` still know only about themselves. A third
+architecture is one import and one branch there.
+
+A StyleGAN2 generator emits **one fixed resolution**, but 45% of validation slices
+(103 of 230 — every abdomen and every spine slice) pad to 512. `networks/tiling.py`
+generates those through overlapping 256 windows blended with a raised cosine, so
+all 230 slices are scored and exp5/exp6 stay comparable to exp0–exp4. Nothing in
+the trainer or `evaluate.py` changes: the generator tiles internally.
 
 `model/data/manifest.csv` and `model/data/splits.json` are **committed on
 purpose**. Every experiment must train and validate on the same subjects or the
@@ -169,7 +197,7 @@ excluded from every metric.
 
 ## Verification
 
-`smoke_test.py` runs on CPU in about two minutes and checks three things:
+`smoke_test.py` runs on CPU in a few minutes and checks four things:
 
 1. **Wiring** — the full objective trains; all three networks and optimizers exist.
 2. **Modularity** — `lambda_nce=0` produces a checkpoint with *no* `netF` or
@@ -178,3 +206,17 @@ excluded from every metric.
    identical in the loss values.
 3. **Resume** — 4 epochs straight equals 2 + resume + 2. Currently bit-exact
    (`delta = 0.00e+00`).
+4. **StyleGAN2** — five assertions, four of which guard *silent* failures:
+   - tiled inference of an identity function reconstructs its input exactly, which
+     is only true if the blending weights sum to one at every pixel including the
+     borders;
+   - exp5's checkpoint holds `pl_mean` and **no** `netF`, exp6's the reverse — the
+     same structural argument as check 2, proving exp5 really runs StyleGAN2's
+     loss rather than a zero-weighted composite;
+   - two eval forwards on one input are bit-identical, proving noise injection is
+     off at evaluation and `mae_norm` is not a random variable;
+   - StyleGAN2 conv weights have std ≈1 — if anything ever routes them through
+     `init_weights` they become N(0,0.02) *and* runtime-scaled, roughly 50× too
+     small, and the network trains happily while learning nothing;
+   - GAN warm-up with no reconstruction term is refused at config time rather than
+     crashing inside `backward_G` on a loss that never entered the graph.

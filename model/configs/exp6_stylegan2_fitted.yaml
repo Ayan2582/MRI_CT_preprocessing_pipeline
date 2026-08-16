@@ -1,0 +1,96 @@
+# exp6 — the same StyleGAN2 networks, at exp2's loss and at settings chosen for
+# THIS dataset rather than for FFHQ.
+#
+#   L_total = L_cGAN(logistic) + 100 * L_L1 + 1 * L_PatchNCE
+#
+# The lambdas are exp2_paper's exactly, so exp6 vs exp2 is a one-variable
+# comparison: same loss, same data, same split, different architecture. This is the
+# candidate run. exp5 is the reference.
+#
+# WHAT CHANGED FROM exp5, AND WHY — every one of these is a property of the data,
+# not a hyper-parameter preference:
+#
+#   channel_base/max halved   config-f's 29M-parameter generator was fitted to
+#                             FFHQ's 70k images. There are 1687 training slices
+#                             here. A 4x narrower net is the single most useful
+#                             adaptation, and it buys back batch 8.
+#
+#   diffaug drops 'color'     patchgan.py:73-75 gives D's first conv no norm
+#                             specifically so it can still see absolute intensity,
+#                             "meaningful here because both modalities are
+#                             calibrated to a fixed [0,1] range". Colour jitter
+#                             attacks exactly that calibration, and on 1-channel
+#                             data its saturation component means nothing anyway.
+#
+#   noise_max_resolution 64   noise at 128 and 256 px invents fine texture that has
+#                             no counterpart in the source MRI — hallucinated
+#                             detail a reader would interpret as a finding. Coarse
+#                             layers keep the mechanism without that risk.
+#
+#   style_mixing_prob 0       the second w could only come from another patient's
+#                             slice, and lambda_l1 = 100 demands per-pixel
+#                             agreement with THIS patient's CT.
+#
+#   path_length off           it conditions the w-to-image map for smooth latent
+#                             interpolation, which never happens here. With no
+#                             prior to sample from it must be estimated from the
+#                             batch in flight, which is noisy at this scale.
+
+_base_: base.yaml
+
+run:
+  name: exp6_stylegan2_fitted
+
+model:
+  generator:
+    type: stylegan2
+    num_downs: 6
+    channel_base: 16384      # half of config-f
+    channel_max: 256
+    style_mixing_prob: 0.0
+    noise_max_resolution: 64
+
+  discriminator:
+    type: stylegan2
+    channel_base: 16384
+    channel_max: 256
+    mbstd_group_size: 4      # divides train.batch_size: 8
+
+loss:
+  gan_mode: vanilla          # StyleGAN2's objective, matching exp5 so the two
+                             # StyleGAN2 runs differ only where the table above says
+  lambda_gan: 1.0
+  lambda_l1: 100.0           # exp2's weights, exactly
+  lambda_nce: 1.0
+
+stabilizers:
+  spectral_norm_d: false
+  label_smoothing:
+    enabled: false
+
+  r1:
+    enabled: true
+    gamma: 1.6               # 0.0002 * 256^2 / 8. Lower than exp5's because the
+                             # batch is twice as large; the heuristic scales as 1/M.
+    every: 16
+
+  path_length:
+    enabled: false
+
+  diffaug:
+    enabled: true
+    policy: translation,cutout
+
+train:
+  # MEASURED: G 17.9M + D 7.2M = 25.1M parameters — less than half of
+  # exp2_paper's 57.2M, and under a third of exp5's 85.4M. That is the point:
+  # 1687 training slices do not support a 29M-parameter generator, and the
+  # smaller footprint is what makes batch 8 fit alongside R1.
+  batch_size: 8
+  lr: 1.0e-3
+  beta1: 0.0                 # StyleGAN2's betas
+  beta2: 0.99
+  gan_warmup_epochs: 5       # base.yaml's value. A synthesis network starting from
+                             # a learned constant benefits more from this than the
+                             # U-Net did: it has no skip connections to hand it
+                             # plausible anatomy for free.

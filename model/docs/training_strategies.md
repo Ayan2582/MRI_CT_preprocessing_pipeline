@@ -107,7 +107,7 @@ defaults to `false`.
 
 ---
 
-## Part 3 — The six stabilisers
+## Part 3 — The seven stabilisers
 
 Each fixes a specific failure. Presented failure-first, because that is how you
 will encounter them.
@@ -230,6 +230,36 @@ G finds one output that fools D and emits it regardless of input. Mostly an
 impossible, since a collapsed G would have catastrophic L1. Worth knowing the
 term; not something to defend against in this setup.
 
+**Except in `exp5_stylegan2_vanilla`, which has no L1 at all.** That run is the
+one configuration in this repository where mode collapse is a live risk, and it
+is also the one whose discriminator carries a minibatch-stddev layer — the
+standard defence, which lets D read the batch's output diversity directly off a
+feature map.
+
+### Failure 5 — The generator's style-to-image map is ill-conditioned
+
+*StyleGAN2 only.* A fixed-size step in the style space W moves the image a lot in
+some directions and barely at all in others, which makes the optimisation surface
+awkward and training slower to settle.
+
+#### Path-length regularization — `stabilizers.path_length` (default OFF)
+
+Penalises the deviation of the image-space Jacobian norm from a running mean, so
+a step in W produces a consistent change wherever you take it. It needs a **double
+backward through G**, so it runs lazily (every 4 G steps, scaled by 4) and in fp32
+as its own optimisation step — mixing a scaled and an unscaled backward through
+one GradScaler is where silent gradient corruption lives.
+
+Two caveats specific to this project:
+
+- It is **meaningless for the U-Net**, which has no W. Enabling it there is a
+  startup error rather than a silent no-op.
+- The paper samples `w` from the mapping network's Gaussian prior. There is no
+  prior in a translation model — every `w` is a real patient's encoding — so the
+  estimate comes from the batch in flight and is noisier than the published
+  version. `exp6_stylegan2_fitted` turns it off for that reason; the property it
+  buys (smooth latent interpolation) is one this project never uses.
+
 ### Summary
 
 | stabiliser | fixes | cost | default |
@@ -240,6 +270,23 @@ term; not something to defend against in this setup.
 | label smoothing | D over-confidence | free | **on** |
 | TTUR | D wins too hard | free | off |
 | R1 penalty | D memorises | ~30% of D | off |
+| path-length reg | ill-conditioned W→image map | ~15% of G | off |
+
+**A note on R1's γ, which is easy to get wrong.** `base.yaml` ships `gamma: 10.0`,
+which is StyleGAN2's value for FFHQ at **1024 px**. The published heuristic is
+`γ = 0.0002 · N² / M` for resolution N and batch M — at 256 px that is 3.3 at
+batch 4 and 1.6 at batch 8. Carrying the 1024 px number across a 16× change in
+pixel count gives a discriminator so smoothed it stops discriminating, which
+presents as `G_GAN` flatlining and reads as "the GAN isn't earning its keep" —
+corrupting exactly the comparison `exp0` exists to make.
+
+**Which stabilisers the StyleGAN2 runs use.** They switch off spectral norm and
+label smoothing and turn R1 on. That is not preference: equalized learning rate
+plus R1 *is* StyleGAN2's stability mechanism, and layering this project's usual
+stabilisers on top would constrain D twice over. DiffAugment stays on in both —
+the original paper used no augmentation, but it had 70k images against this
+dataset's 1687, so running unaugmented would reproduce a known failure rather
+than reproduce the paper.
 
 ---
 
@@ -270,6 +317,13 @@ adversarial term is not applied. This lets G produce something anatomically sane
 before D starts critiquing it. Cheap insurance against early collapse, when a
 randomly-initialised G produces noise and a discriminator can trivially reach
 100% accuracy — which is Failure 1 on epoch 1.
+
+**It requires a reconstruction term to warm up on.** With `λ_L1 = 0` *and*
+`λ_NCE = 0` — `exp5_stylegan2_vanilla`, and `exp0` for the opposite reason — a
+warm-up epoch would leave the generator with no loss at all, and the backward
+pass would fail on a scalar that never entered the graph. `LossPlan` refuses that
+combination at config time rather than letting it crash five layers down, so a
+purely adversarial run must set `gan_warmup_epochs: 0`.
 
 ---
 

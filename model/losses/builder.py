@@ -53,6 +53,25 @@ class LossPlan:
                 "loss.lambda_l1, loss.lambda_nce to a non-zero value."
             )
 
+        # GAN warm-up means "train on the reconstruction terms only for N epochs,
+        # so G produces something anatomically sane before D starts critiquing".
+        # With no reconstruction term there is nothing to warm up ON: the warm-up
+        # epochs would leave backward_G with a freshly-created zero scalar that
+        # never entered the graph, and .backward() raises "element 0 of tensors
+        # does not require grad" — five layers from the config that caused it.
+        # A purely adversarial objective (StyleGAN2's own) is a legitimate
+        # configuration; combining it with a warm-up is not.
+        self.gan_warmup_epochs = int(cfg.get_path("train.gan_warmup_epochs", 0))
+        if self.gan_warmup_epochs > 0 and not (self.use_l1 or self.use_nce):
+            raise ValueError(
+                f"train.gan_warmup_epochs is {self.gan_warmup_epochs}, but both "
+                f"loss.lambda_l1 and loss.lambda_nce are zero. Warm-up trains on "
+                f"the reconstruction terms while the discriminator is held back, "
+                f"and there are none here — the first epoch would have no loss at "
+                f"all. Set train.gan_warmup_epochs: 0 for a purely adversarial "
+                f"run (see configs/exp5_stylegan2_vanilla.yaml)."
+            )
+
     @property
     def use_gan(self):
         """False means: build no discriminator, run no D pass, save no D state."""
@@ -95,7 +114,13 @@ class LossPlan:
                 return "pix2pix + PatchNCE"
             if self.use_l1:
                 return "pix2pix"
-            return "CUT-like (contrastive, no L1)"
+            if self.use_nce:
+                return "CUT-like (contrastive, no L1)"
+            # Purely adversarial — StyleGAN2's own objective. This branch used to
+            # fall through to the CUT label, which named a contrastive term that a
+            # lambda_nce=0 run does not have. That is exactly the confusion this
+            # method exists to prevent.
+            return "adversarial-only (no reconstruction term)"
 
         # No adversary: these are regression baselines, not GANs.
         if self.use_l1 and self.use_nce:

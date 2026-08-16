@@ -1,0 +1,100 @@
+# exp5 — StyleGAN2 at its own settings, with its own objective.
+#
+#   L_total = L_adversarial       (non-saturating logistic)  +  R1  +  path length
+#
+# NO L1. NO PatchNCE. This is the loss the StyleGAN2 paper trains, unmodified.
+#
+# WHAT THIS RUN IS FOR. It is the mirror image of exp0_l1_only. exp0 is a
+# regression with no adversary — the floor. This is an adversary with no
+# regression — the ceiling. Neither is a candidate for deployment; both are bounds
+# that say how much of the result is coming from which half of the objective.
+#
+# EXPECT mae_norm TO BE POOR, AND DO NOT READ THAT AS A BUG. With no pixel-wise
+# term, the only thing tying the synthesised CT to the input MRI is the conditional
+# discriminator seeing cat[MRI, CT]. That is pix2pix-without-L1, which the pix2pix
+# paper itself ablates and reports as substantially worse. Read this run for
+# texture realism and training stability; read exp6 for accuracy.
+#
+# Note that eval.selection_metric is still mae_norm, inherited from base.yaml. It
+# ranks this run's checkpoints by a quantity its objective never optimises. That is
+# deliberate — it keeps best.pt selection identical across the whole ladder — but
+# it is worth knowing rather than discovering.
+
+_base_: base.yaml
+
+run:
+  name: exp5_stylegan2_vanilla
+
+model:
+  generator:
+    type: stylegan2
+    num_downs: 6             # 256 -> 4 is 6 downsamplings. dataset.py reads this
+                             # to set the validation padding multiple, so it must
+                             # agree with native_size / const_size; the builder
+                             # checks that it does.
+    channel_base: 32768      # config-f, unchanged
+    channel_max: 512
+    style_mixing_prob: 0.9   # the paper's value. Safe here specifically BECAUSE
+                             # there is no L1 term for a second patient's style to
+                             # contradict — exp6 turns it off for that reason.
+    noise_max_resolution: 0  # noise at every layer, as published
+
+  discriminator:
+    type: stylegan2
+    channel_base: 32768
+    channel_max: 512
+    mbstd_group_size: 4      # divides train.batch_size below
+
+loss:
+  gan_mode: vanilla          # non-saturating logistic — StyleGAN2's objective.
+                             # base.yaml's lsgan is the pix2pix default and is not
+                             # what this architecture was tuned against.
+  lambda_gan: 1.0
+  lambda_l1: 0.0             # builds no L1 path at all
+  lambda_nce: 0.0            # builds no projection heads and no optimizer_F
+
+stabilizers:
+  # StyleGAN2's stability story is equalized learning rate plus R1. Layering this
+  # project's usual stabilisers on top would constrain D twice.
+  spectral_norm_d: false
+  label_smoothing:
+    enabled: false
+
+  r1:
+    enabled: true
+    gamma: 3.3               # 0.0002 * 256^2 / 4. See the note in base.yaml: the
+                             # paper's 10.0 is its 1024 px value. If G_GAN
+                             # flatlines, D is over-smoothed — raise this first.
+    every: 16
+
+  path_length:
+    enabled: true
+    weight: 2.0
+    every: 4
+
+  # DiffAugment stays ON even though the original paper used no augmentation: it
+  # had 70k images and this has 1687. Running unaugmented here would reproduce a
+  # known failure rather than reproduce the paper.
+  diffaug:
+    enabled: true
+    policy: color,translation,cutout
+
+train:
+  # MEASURED: G 56.5M + D 28.9M = 85.4M parameters, against exp2_paper's
+  # 54.4M + 2.8M = 57.2M. The generator is large because it carries a full
+  # encoder AND a full synthesis network; the discriminator is 10x the PatchGAN.
+  # On top of that, R1 and path-length each add a backward pass.
+  #
+  # Batch 4 is an estimate for a 16 GB T4, not a measured figure. If it OOMs:
+  #   --set train.batch_size=2 model.discriminator.mbstd_group_size=2 \
+  #         stabilizers.r1.gamma=6.6
+  # All three must move together — the group size has to divide the batch, and
+  # gamma = 0.0002 * 256^2 / batch.
+  batch_size: 4
+  lr: 1.0e-3                 # StyleGAN2 uses 2e-3 at batch 32; halved at this scale
+  beta1: 0.0                 # StyleGAN2's betas, not pix2pix's (0.5, 0.999).
+  beta2: 0.99                # They matter once regularisation is lazy.
+  gan_warmup_epochs: 0       # REQUIRED. Warm-up trains the reconstruction terms
+                             # while D is held back, and there are none here — the
+                             # first epoch would have no loss at all. LossPlan
+                             # raises if this is nonzero with no L1 and no NCE.
