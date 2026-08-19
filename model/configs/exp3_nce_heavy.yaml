@@ -1,7 +1,9 @@
 # exp3 — lean on PatchNCE. An open question, not a favourite.
 #
-# Halves lambda_l1 and doubles lambda_nce relative to exp2, shifting weight from
-# pixel-exact agreement onto structural correspondence.
+# Takes lambda_l1 to a QUARTER of exp2's and lambda_nce to five times it (100/1
+# -> 25/5), shifting weight from pixel-exact agreement onto structural
+# correspondence. Note this leaves exp3 and exp4 sharing lambda_nce = 5, so the
+# two now differ only in how much pixel anchor is left: 25 against exp4's 10.
 #
 # WHAT THIS IS NOT. An earlier version of this file justified the reweighting by
 # the median 5.2 degree CT/MRI frame mismatch reported in

@@ -62,7 +62,7 @@ Run in order. Each answers exactly one question; each is one config file.
 | 0 | `exp0_l1_only` | 0 | 100 | 0 | 0 | U-Net + PatchGAN | is the GAN earning its keep at all? |
 | 1 | `exp1_pix2pix` | 1 | 100 | 0 | 0 | U-Net + PatchGAN | what does the standard recipe give? |
 | 2 | `exp2_paper` | 1 | 100 | 1 | 0 | U-Net + PatchGAN | the target loss, textbook weights |
-| 3 | `exp3_nce_heavy` | 1 | 50 | 2 | 0 | U-Net + PatchGAN | lean on NCE — open question |
+| 3 | `exp3_nce_heavy` | 1 | 25 | 5 | 0 | U-Net + PatchGAN | lean on NCE — open question |
 | 4 | `exp4_nce_max` | 1 | 10 | 5 | 0 | U-Net + PatchGAN | where does hallucination start? |
 | 5 | `exp5_stylegan2_vanilla` | 1 | **0** | **0** | 0 | StyleGAN2 | what does StyleGAN2's *own* loss give? |
 | 6 | `exp6_stylegan2_fitted` | 1 | 100 | 1 | 0 | StyleGAN2 | does the architecture beat the U-Net? |

@@ -108,32 +108,61 @@ shows `CT/` and `MRI/` as browsable folders, not as two unextracted `.zip` files
 
 ## 4. Get the code onto Kaggle
 
-**A — clone from GitHub** (needs Settings → Internet **On**, and a public repo).
-
-Push `model/` first:
+**Push to GitHub. The notebook clones it.** That is the whole mechanism, and it is
+the only one that cannot go stale, because there is no second copy of the code to
+keep in sync.
 
 ```bash
 git add .gitignore model/
-git commit -m "Add pix2pix + PatchNCE model"
+git commit -m "<what changed>"
 git push origin main
 ```
 
-That pushes the 44 code files plus `manifest.csv` and `splits.json` (both
-intentionally tracked); `runs/` and `kaggle_dataset/` are gitignored. The repo
-contains no patient data — `qc_workspace/` and `Raw_data_mri_ct/` are ignored —
-so making it public exposes nothing.
+`git status --short` before you push: the tracked set is `.py`, `.yaml`, `.md` and
+`.ipynb` under `model/`, plus `manifest.csv` and `splits.json` (both intentionally
+tracked, so every experiment trains and validates on the same subjects). `runs/`,
+`kaggle_dataset/` and `kaggle_code/` are gitignored. The repo contains no patient
+data — `qc_workspace/` and `Raw_data_mri_ct/` are ignored — so making it public
+exposes nothing.
 
-Then in the notebook:
+**It must go to `main`.** Cell 2 runs `git clone --depth 1` with no `--branch`, so
+it takes the default branch. Work pushed to a feature branch never reaches Kaggle.
 
-```python
-REPO_URL = 'https://github.com/Ayan2582/MRI_CT_preprocessing_pipeline.git'
-```
+Requires Settings → Internet **On**, and a public repo. Cell 2 pulls an existing
+clone rather than skipping it, and prints the HEAD it ended up on — check that
+line matches what you just pushed before you spend GPU hours.
 
-**B — upload `model/` as a second Kaggle dataset.** Works with internet off, and
-with a private GitHub repo. Nothing outside `model/` is needed for training:
-`bootstrap.py` only reaches into `Preprocessing/` for the HU windows, and those
-are already baked into the manifest. Point `REPO_DIR` at the mounted path and
-skip the clone cell.
+### The offline fallback, and why it is frozen
+
+`model/` can also be uploaded as a Kaggle dataset and used with internet off or a
+private repo: point `REPO_DIR` at the mount and skip the clone. Nothing outside
+`model/` is needed for training — `bootstrap.py` only reaches into
+`Preprocessing/` for the HU windows, and those are already baked into the manifest.
+
+There is an old artifact of exactly this, `model/kaggle_code/` →
+`ayan102/mri-ct-model-code`. **It is frozen at Aug 2025 and is not maintained.** It
+was hand-built with no script and no git history, and it drifted because the whole
+1.7 GB packaged dataset sits nested inside it — so changing one line of Python cost
+a 1.7 GB re-upload, and after a few rounds nobody paid it. It is missing
+`training/builder.py` among others, so a run launched from it now fails at import.
+Do not train from it.
+
+**Do not delete that dataset on Kaggle either.**
+`exp2_paper_results/config.resolved.yaml` records
+`data.root: /kaggle/input/datasets/ayan102/mri-ct-model-code/kaggle_dataset` —
+exp2 was trained off the copy of the data bundled inside it, so removing it breaks
+any resume or re-evaluation of that run.
+
+If you ever do need the offline path again, build the staging directory fresh from
+`model/` and leave the data out of it — the data already has its own dataset, and
+one input more is cheaper than a gigabyte-scale upload per code change.
+
+### Which dataset supplies the data
+
+`ayan102/mri-ct-paired-slices`, the output of `package_for_kaggle.py`. Attach it
+under **+ Add Input**; cell 5 finds it by globbing `/kaggle/input/*/manifest.csv`,
+so nothing needs editing. That glob is also why attaching two datasets that both
+carry a `manifest.csv` is a bad idea — it takes the first hit alphabetically.
 
 ---
 
@@ -142,14 +171,21 @@ skip the clone cell.
 kaggle.com/code → **New Notebook** → **File** → **Import Notebook** → **Upload**
 → pick `model/notebooks/kaggle_train.ipynb`.
 
+> **The notebook is the one file `git pull` does NOT deliver.** Everything else
+> reaches the session through the clone in cell 2, but the notebook itself lives on
+> Kaggle — it was uploaded once and is not read from the repo. So editing
+> `kaggle_train.ipynb` here changes nothing on Kaggle until you re-import it (or
+> paste the changed cell in by hand). That cuts both ways: a cell-2 fix pushed to
+> git cannot fix the cell 2 that is actually running.
+
 Then in the right-hand panel:
 
 | setting | value | why |
 |---|---|---|
 | Accelerator | **GPU T4 x2** | **not P100** — see below. The code is single-GPU, so the second T4 sits idle; that is fine |
-| Internet | **On** | needed for `git clone` (not needed with option B) |
-| Persistence | Files only | keeps `/kaggle/working` between runs — but see the stale-clone warning below |
-| Input | **+ Add Input** → your dataset | mounts it under `/kaggle/input/` |
+| Internet | **On** | needed for `git clone`/`git pull` in cell 2 |
+| Persistence | Files only | keeps `/kaggle/working` (and so `runs/`) between sessions, which is what makes a split run resumable |
+| Input | **+ Add Input** → `mri-ct-paired-slices` | mounts it under `/kaggle/input/` |
 
 > **Do not pick P100.** It is the faster card on paper, and this table used to
 > recommend it. Recent PyTorch builds dropped Pascal (sm_60), so a P100 session
@@ -157,12 +193,14 @@ Then in the right-hand panel:
 > startup, but at the first CUDA op, after you have already spent the setup time.
 > `docs/notebook_walkthrough.md` records the same finding.
 
-> **Persistence + the clone guard is a trap.** Cell 2 clones only
-> `if not os.path.isdir(REPO_DIR)`. With persistence on, `/kaggle/working` survives
-> between sessions, so an existing clone is *never* refreshed and code you pushed
-> since then never arrives — the run trains happily with the old code. After any
-> push, either delete `/kaggle/working/MRI_CT_preprocessing_pipeline` or run
-> `git -C /kaggle/working/MRI_CT_preprocessing_pipeline pull` before training.
+> **Persistence used to make stale code a silent failure.** Cell 2 once cloned only
+> `if not os.path.isdir(REPO_DIR)`, and `/kaggle/working` survives between sessions —
+> so a clone made weeks earlier was never refreshed and the run trained happily on
+> old code. It now `git pull --ff-only`s an existing clone instead, falling back to
+> deleting and re-cloning if the pull fails (a commit made inside a previous
+> session, or a force-push upstream). Nothing to remember after a push — but do read
+> the `HEAD:` line the cell prints, because a pull that fetched nothing and a pull
+> that fetched your work look identical until you check the commit.
 
 Quota is **30 GPU-hours/week**, reset Saturday. One 200-epoch experiment is
 roughly 3-5 hours, so budget ~2 sessions per experiment.
