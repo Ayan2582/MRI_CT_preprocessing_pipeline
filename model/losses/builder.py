@@ -3,7 +3,13 @@ builder.py
 ──────────
 Assembles the loss terms a config actually asks for.
 
-    L_total = lambda_gan * L_cGAN + lambda_l1 * L_L1 + lambda_nce * L_PatchNCE
+    L_total = lambda_gan   * L_cGAN
+            + lambda_l1    * L_L1          (pixel-aligned)
+            + lambda_nce   * L_PatchNCE
+            + lambda_corr  * L_L1(warp(fake, phi), real)   RegGAN
+            + lambda_smooth* ||grad phi||^2                RegGAN
+            + lambda_cycle * L_L1(G_B2A(G_A2B(A)), A)      CycleGAN, both ways
+            + lambda_cycle * lambda_identity * L_L1(G(x), x)   CycleGAN
 
 The rule this module enforces is that a zero lambda removes a term's ENTIRE code
 path, not merely its contribution. Multiplying a computed loss by 0.0 would give
@@ -37,6 +43,23 @@ class LossPlan:
         self.lambda_gan = float(cfg.get_path("loss.lambda_gan", 1.0))
         self.lambda_l1 = float(cfg.get_path("loss.lambda_l1", 100.0))
         self.lambda_nce = float(cfg.get_path("loss.lambda_nce", 0.0))
+
+        # RegGAN. lambda_corr is L1 taken in the frame a learned deformation
+        # puts the prediction into, and lambda_smooth is the penalty that keeps
+        # that deformation a registration rather than a free reparameterisation.
+        # They are inseparable: lambda_corr with lambda_smooth at zero has a
+        # degenerate optimum, which losses/registration.py explains at length.
+        self.lambda_corr = float(cfg.get_path("loss.lambda_corr", 0.0))
+        self.lambda_smooth = float(cfg.get_path("loss.lambda_smooth", 0.0))
+
+        # CycleGAN. lambda_identity is a FRACTION OF lambda_cycle, not an
+        # absolute weight — the reference implementation's convention, kept
+        # because every published value for it (0.5) is quoted in those terms.
+        # Read as an absolute weight, 0.5 against a cycle weight of 10 would be
+        # twenty times weaker than intended and the term would do nothing.
+        self.lambda_cycle = float(cfg.get_path("loss.lambda_cycle", 0.0))
+        self.lambda_identity = float(cfg.get_path("loss.lambda_identity", 0.0))
+
         self.gan_mode = cfg.get_path("loss.gan_mode", "lsgan")
 
         self.nce_layers = list(cfg.get_path("loss.nce.layers", [0, 1, 2, 3, 4]))
@@ -46,11 +69,23 @@ class LossPlan:
         self.nce_idt = bool(cfg.get_path("loss.nce.nce_idt", False))
         self.nce_dim = int(cfg.get_path("loss.nce.nce_dim", 256))
 
-        if not (self.use_gan or self.use_l1 or self.use_nce):
+        if self.use_corr and self.lambda_smooth <= EPS:
             raise ValueError(
-                "All three lambdas are zero, so the generator has no training "
-                "signal at all. Set at least one of loss.lambda_gan, "
-                "loss.lambda_l1, loss.lambda_nce to a non-zero value."
+                "loss.lambda_corr > 0 with loss.lambda_smooth == 0. The "
+                "correction loss warps the prediction by a learned field before "
+                "comparing it to the target, and an unpenalised field can warp "
+                "almost any prediction onto almost any target — the loss would "
+                "fall to zero while the generator learned nothing. Set "
+                "loss.lambda_smooth (exp7_reggan.yaml uses 10.0)."
+            )
+
+        if not (self.use_gan or self.use_l1 or self.use_nce or self.use_corr
+                or self.use_cycle):
+            raise ValueError(
+                "Every lambda is zero, so the generator has no training signal "
+                "at all. Set at least one of loss.lambda_gan, loss.lambda_l1, "
+                "loss.lambda_nce, loss.lambda_corr, loss.lambda_cycle to a "
+                "non-zero value."
             )
 
         # GAN warm-up means "train on the reconstruction terms only for N epochs,
@@ -62,11 +97,14 @@ class LossPlan:
         # A purely adversarial objective (StyleGAN2's own) is a legitimate
         # configuration; combining it with a warm-up is not.
         self.gan_warmup_epochs = int(cfg.get_path("train.gan_warmup_epochs", 0))
-        if self.gan_warmup_epochs > 0 and not (self.use_l1 or self.use_nce):
+        if self.gan_warmup_epochs > 0 and not (self.use_l1 or self.use_nce
+                                               or self.use_corr
+                                               or self.use_cycle):
             raise ValueError(
                 f"train.gan_warmup_epochs is {self.gan_warmup_epochs}, but both "
-                f"loss.lambda_l1 and loss.lambda_nce are zero. Warm-up trains on "
-                f"the reconstruction terms while the discriminator is held back, "
+                f"loss.lambda_l1, loss.lambda_nce, loss.lambda_corr and "
+                f"loss.lambda_cycle are zero. Warm-up trains on the "
+                f"reconstruction terms while D is held back, "
                 f"and there are none here — the first epoch would have no loss at "
                 f"all. Set train.gan_warmup_epochs: 0 for a purely adversarial "
                 f"run (see configs/exp5_stylegan2_vanilla.yaml)."
@@ -86,6 +124,34 @@ class LossPlan:
         """False means: build no MLP heads, tap no features, create no optimizer_F."""
         return self.lambda_nce > EPS
 
+    @property
+    def use_corr(self):
+        """
+        False means: build no registration network, no optimizer_R, no warp.
+
+        True is what makes this a RegGAN run. Note it is independent of use_l1 —
+        exp7 sets lambda_l1 to zero so that the ONLY reconstruction signal is the
+        registered one, which is the published objective. Running both is a legal
+        ablation, not the default.
+        """
+        return self.lambda_corr > EPS
+
+    @property
+    def use_cycle(self):
+        """
+        False means: no cycle-consistency term. True is what makes a run CycleGAN.
+
+        It is a reconstruction term, so it satisfies the GAN warm-up requirement
+        the same way L1 does — there is something to train on while D is held
+        back, even though nothing here compares against a paired target.
+        """
+        return self.lambda_cycle > EPS
+
+    @property
+    def use_identity(self):
+        """Identity mapping term. Only meaningful alongside the cycle term."""
+        return self.use_cycle and self.lambda_identity > EPS
+
     def describe(self):
         """One-line human summary, logged at startup and written into the run dir."""
         parts = []
@@ -93,6 +159,14 @@ class LossPlan:
             parts.append(f"{self.lambda_gan:g}*L_cGAN({self.gan_mode})")
         if self.use_l1:
             parts.append(f"{self.lambda_l1:g}*L_L1")
+        if self.use_corr:
+            parts.append(f"{self.lambda_corr:g}*L_corr(registered L1)")
+            parts.append(f"{self.lambda_smooth:g}*L_smooth(grad phi)")
+        if self.use_cycle:
+            parts.append(f"{self.lambda_cycle:g}*L_cycle")
+            if self.use_identity:
+                parts.append(f"{self.lambda_cycle * self.lambda_identity:g}"
+                             f"*L_identity")
         if self.use_nce:
             parts.append(f"{self.lambda_nce:g}*L_PatchNCE"
                          f"(layers={self.nce_layers}, patches={self.num_patches})")
@@ -109,6 +183,24 @@ class LossPlan:
         surprisingly easy to believe you are running the full objective when an
         override quietly disabled a term.
         """
+        # CycleGAN and RegGAN are identified by the terms that are unique to
+        # them, not by their lambdas' ratios, so both are tested first.
+        if self.use_cycle:
+            return ("CycleGAN (unpaired)" if self.use_identity
+                    else "CycleGAN (unpaired, no identity term)")
+
+        # RegGAN is identified by its correction term, not by its lambdas'
+        # ratios, so it is tested before everything else.
+        if self.use_corr:
+            name = "RegGAN (registration-corrected L1)"
+            if not self.use_gan:
+                return name + ", no adversary"
+            if self.use_l1:
+                return name + " + unwarped L1"
+            if self.use_nce:
+                return name + " + PatchNCE"
+            return name
+
         if self.use_gan:
             if self.use_l1 and self.use_nce:
                 return "pix2pix + PatchNCE"
@@ -145,7 +237,12 @@ def build_losses(cfg):
         from .gan_loss import build_gan_loss
         modules["gan"] = build_gan_loss(cfg)
 
-    if plan.use_l1:
+    if plan.use_l1 or plan.use_corr or plan.use_cycle:
+        # `or plan.use_corr` because RegGAN's correction term is itself a masked
+        # L1 — just taken after the warp — and `or plan.use_cycle` because
+        # CycleGAN's cycle and identity terms are too. Both exp7 and exp8 run
+        # with lambda_l1 == 0, so gating this on use_l1 alone would leave
+        # criteria["l1"] missing and both models would KeyError on step one.
         import torch.nn as nn
         # reduction='none' so the validity mask from the dataset can exclude
         # padded pixels before the mean is taken. Averaging over padding would

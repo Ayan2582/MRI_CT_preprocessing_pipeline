@@ -50,6 +50,21 @@ data:
   # mask keeps it out of every loss and metric.
   use_roi: true
 
+  # ── CycleGAN only (model.name: cyclegan) ───────────────────────────────────
+  # Train on UNPAIRED data: the training subjects are split into two disjoint
+  # halves and the MRI is drawn only from one, the CT only from the other, so no
+  # patient ever contributes both modalities. Shuffling rows within a single pool
+  # would keep more slices per domain, but the model could still see both
+  # modalities of one patient and "unpaired" would be a claim the experiment does
+  # not support.
+  #
+  # VALIDATION AND TEST STAY PAIRED regardless. Every metric compares a
+  # prediction against ITS target, so an unpaired validation set would report
+  # numbers that mean nothing while still drawing a convincing curve.
+  unpaired: false
+  unpaired_split_seed: 1337   # which patients land in which domain; fixed so the
+                              # partition survives resumes and machines
+
   augment:
     hflip: false             # applied identically to MRI and CT
     # Rotation/scaling are deliberately NOT offered. Manual QC corrected
@@ -60,6 +75,15 @@ data:
 
 # ── Networks ─────────────────────────────────────────────────────────────────
 model:
+  # Which training model drives the step. The generator and discriminator TYPES
+  # below choose an architecture; this chooses the objective's whole structure —
+  # how many networks there are and what the step does with them.
+  #
+  #   pix2pix_nce  one G, one D, conditional. exp0..exp6 are all this.
+  #   reggan       adds a registration network R and takes L1 in the frame R's
+  #                deformation field puts the prediction into. See exp7.
+  name: pix2pix_nce
+
   generator:
     type: unet
     in_channels: 1
@@ -129,6 +153,16 @@ model:
                              # change the group size mid-run
     mbstd_num_channels: 1
 
+  # ── RegGAN only (model.name: reggan) ───────────────────────────────────────
+  # The network that predicts the residual misalignment between the generated CT
+  # and the real one. Kept deliberately small: it has to represent a smooth,
+  # near-identity field, and any capacity beyond that is capacity to explain the
+  # generator's mistakes away as deformation. See networks/registration.py.
+  registration:
+    nrf: 32
+    num_downs: 4
+    norm: instance
+
 # ── Loss ─────────────────────────────────────────────────────────────────────
 # L_total = lambda_gan * L_cGAN + lambda_l1 * L_L1 + lambda_nce * L_PatchNCE
 #
@@ -146,6 +180,34 @@ loss:
   lambda_l1: 100.0           # ~99% of gradient magnitude. L1 supplies the
                              # anatomy; the GAN term only supplies texture.
   lambda_nce: 1.0
+
+  # ── RegGAN only ────────────────────────────────────────────────────────────
+  # lambda_corr is L1 taken AFTER a learned deformation has registered the
+  # prediction onto the target. It is meant to REPLACE lambda_l1 rather than
+  # supplement it — exp7 sets lambda_l1 to 0 so the only reconstruction signal is
+  # the registered one, which is the published objective. Running both is a legal
+  # ablation, not the default.
+  #
+  # lambda_smooth penalises the field's spatial gradient, and is not optional
+  # garnish: an unconstrained field can warp almost any prediction onto almost
+  # any target, so L_corr would fall to zero while the generator learned nothing
+  # and no curve looked wrong. LossPlan refuses to run lambda_corr without it.
+  lambda_corr: 0.0
+  lambda_smooth: 0.0
+
+  # ── CycleGAN only ──────────────────────────────────────────────────────────
+  # lambda_cycle weights ||G_B2A(G_A2B(A)) - A||, in both directions: the only
+  # thing tying the output to THIS patient's anatomy when no paired target
+  # exists.
+  #
+  # lambda_identity is a FRACTION OF lambda_cycle, not an absolute weight. That
+  # is the reference implementation's convention and every published value for it
+  # is quoted that way, so 0.5 against lambda_cycle 10 means an effective weight
+  # of 5. It asks that a generator handed an image already in its target domain
+  # return it unchanged, which is what stops both generators agreeing on a
+  # consistent global HU shift that the cycle would happily undo.
+  lambda_cycle: 0.0
+  lambda_identity: 0.0
 
   nce:
     # Tap indices into the generator encoder. Tap 0 is the input image itself;
@@ -255,6 +317,12 @@ train:
   gan_warmup_epochs: 5
 
   grad_clip: 0.0             # 0 disables
+
+  # CycleGAN only: how many past fakes each discriminator is shown alongside the
+  # current ones. Without it G and D chase each other — D forgets every texture
+  # it just learned to reject, because no example of it will appear again. 0
+  # disables the buffer. Not checkpointed; it refills within an epoch.
+  image_pool_size: 50
 
 # ── Evaluation ───────────────────────────────────────────────────────────────
 eval:

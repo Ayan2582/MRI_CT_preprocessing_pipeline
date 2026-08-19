@@ -26,5 +26,5 @@ run:
 
 loss:
   lambda_gan: 1.0
-  lambda_l1: 50.0
-  lambda_nce: 2.0
+  lambda_l1: 25.0
+  lambda_nce: 5.0

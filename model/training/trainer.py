@@ -33,7 +33,8 @@ from torch.utils.data import DataLoader
 from ..config import dump_config
 from ..data.dataset import to_unit_range
 from ..evaluation.metrics import MetricAccumulator
-from .pix2pix_nce import Pix2PixNCEModel, build_lr_scheduler
+from .builder import build_model
+from .pix2pix_nce import build_lr_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,7 @@ class Trainer:
             os.makedirs(path, exist_ok=True)
         dump_config(cfg, os.path.join(self.run_dir, "config.resolved.yaml"))
 
-        self.model = Pix2PixNCEModel(cfg, self.device)
+        self.model = build_model(cfg, self.device)
         self.datasets = datasets
         self.loaders = self._build_loaders(datasets)
 
@@ -199,9 +200,7 @@ class Trainer:
         return self.best_value
 
     def train_one_epoch(self, epoch):
-        self.model.netG.train()
-        if self.model.netD is not None:
-            self.model.netD.train()
+        self.model.train_mode()
 
         loader = self.loaders["train"]
         print_every = int(self.cfg.get_path("logging.print_every", 50))
@@ -223,6 +222,8 @@ class Trainer:
             if print_every and i % print_every == 0:
                 summary = "  ".join(f"{k}={v:.4f}" for k, v in sorted(stats.items())
                                     if k in ("G_total", "G_L1", "G_GAN", "G_NCE",
+                                             "G_corr", "G_smooth", "R_flow_px",
+                                             "G_cycle_A", "G_cycle_B", "G_GAN_A2B",
                                              "D_total", "D_acc_real", "D_acc_fake"))
                 logger.info("  e%03d %4d/%d  %s", epoch, i, len(loader), summary)
 

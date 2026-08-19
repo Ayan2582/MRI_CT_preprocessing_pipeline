@@ -1,0 +1,75 @@
+# exp8 — CycleGAN. The unpaired baseline: what is the pairing actually worth?
+#
+# THE QUESTION. Every experiment from exp0 to exp7 is handed 2161 QC-accepted
+# MRI/CT correspondences — 129 pairs rejected, 738 slices nudged individually,
+# artifacts erased on 560. That is a large amount of human work, and nothing in
+# this project has ever measured what it bought. exp8 throws the pairing away:
+# two piles of images from disjoint sets of patients, and the model has to find
+# the mapping itself. The gap between exp8 and exp1 is the answer.
+#
+# exp8 IS EXPECTED TO LOSE ON mae_norm, AND THAT IS THE RESULT. Report the size
+# of the gap, not the winner. A small gap would say the QC effort is not where
+# the accuracy comes from; a large one justifies it in a number. It is also the
+# comparison a reader coming from the unpaired literature looks for first, and
+# the one RegGAN's own paper makes.
+#
+# WHAT "UNPAIRED" MEANS HERE, EXACTLY. The 33 training subjects are split into
+# two disjoint halves by data.unpaired_split_seed; the MRI comes only from the
+# first half and the CT only from the second, so no patient ever contributes both
+# modalities. The easier alternative — shuffling CTs within one pool — keeps
+# twice the slices per domain but lets the model see both modalities of the same
+# patient, which would make "unpaired" a claim this experiment does not support.
+# The halved data is the honest price.
+#
+# VALIDATION STAYS PAIRED. build_datasets swaps only the training set. Every
+# metric compares a prediction against ITS target, so an unpaired val set would
+# report meaningless numbers while still drawing a convincing curve — and exp8
+# would not be comparable to anything.
+#
+# WHAT TO WATCH. Cycle consistency is satisfiable by a generator that encodes the
+# input steganographically and decodes it back, producing a plausible CT that is
+# not this patient's. Look at the sample panels, not just mae_norm: exp8 failing
+# by hallucinating a convincing wrong anatomy looks exactly like exp8 failing by
+# being blurry, in the metrics.
+
+_base_: base.yaml
+
+run:
+  name: exp8_cyclegan
+
+model:
+  name: cyclegan
+  discriminator:
+    # Unconditional, and the model refuses to start otherwise. A conditional D
+    # sees cat[MRI, CT] and judges whether the CT corresponds to that MRI — but
+    # here they are different patients and no correspondence is claimed, so it
+    # would be trained on a relationship absent from the data.
+    conditional: false
+
+data:
+  unpaired: true
+
+loss:
+  lambda_gan: 1.0
+
+  # No paired target exists, so there is nothing for an L1 term to compare
+  # against. This is what makes exp8 a genuinely different experiment rather
+  # than exp1 with extra networks.
+  lambda_l1: 0.0
+  lambda_nce: 0.0
+
+  lambda_cycle: 10.0
+
+  # A FRACTION of lambda_cycle, not an absolute weight (see base.yaml), so the
+  # effective identity weight is 5.0. This is the published value.
+  lambda_identity: 0.5
+
+train:
+  # Four networks resident instead of two. 8 will not fit a T4 at 256 px.
+  batch_size: 4
+
+  # Nothing paired to warm up on, and the cycle term is already available from
+  # step 0 — a warm-up here would just train two generators to be each other's
+  # inverse with no pressure toward either domain, which is a worse starting
+  # point than random.
+  gan_warmup_epochs: 0

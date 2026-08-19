@@ -1,0 +1,58 @@
+# exp7 — RegGAN. Stop assuming the frames agree, and measure how much they don't.
+#
+# THE QUESTION THIS ANSWERS, WHICH exp3 COULD ONLY ASK. base.yaml:55-59 records
+# that manual QC on these pairs corrected translation but could not correct
+# in-plane rotation, and that the residual is unmeasured. exp3_nce_heavy.yaml
+# then halves lambda_l1 as a hedge against that residual while saying outright
+# that it does not know its size. This run predicts the residual with a network,
+# scores L1 after applying it, and logs the field's mean magnitude every epoch as
+# R_flow_px — in millimetres, because 1 px = 1 mm here.
+#
+# So exp7 produces a number that decides whether exp3's hedge was ever needed:
+#   R_flow_px -> ~0     the pairs really are aligned. exp3's reweighting was
+#                       hedging against nothing, and exp2 should stay the target.
+#   R_flow_px -> a few  the residual is real and now quantified, and exp7 should
+#                       beat exp2 on mae_norm for a reason we can state.
+# Either outcome is a clean result. That is the point of running it.
+#
+# WHY IT SHOULD WIN IF THE RESIDUAL IS REAL. L1 against a target that sits a
+# degree or two out of frame does not merely score the generator unfairly — it
+# teaches it to blur. When the position of an edge is uncertain, the L1-optimal
+# prediction is a smeared edge, so every millimetre of uncontrolled residual is
+# bought with sharpness. Registering before scoring removes the incentive.
+#
+# WHY IT MIGHT NOT. R has to separate "the target is misaligned" from "the
+# generator was wrong", and nothing supervises that separation directly. The
+# guards are structural rather than learned: lambda_smooth below, R's small
+# capacity (model.registration), and R's zero-initialised output head, which
+# starts training at the identity so epoch 0 is exactly exp1. Watch R_flow_max —
+# if it runs away while G_corr keeps falling, R is absorbing the generator's
+# errors and lambda_smooth is too low.
+
+_base_: base.yaml
+
+run:
+  name: exp7_reggan
+
+model:
+  name: reggan
+
+loss:
+  lambda_gan: 1.0
+
+  # L1 OFF, deliberately. The published objective replaces pixel-aligned L1 with
+  # the registered one rather than adding to it; keeping both would leave a term
+  # that still rewards agreement in the unregistered frame, which is precisely
+  # the pressure this experiment is trying to remove. It also keeps the
+  # comparison against exp1 clean: same weight, same role, one frame apart.
+  lambda_l1: 0.0
+  lambda_corr: 100.0
+
+  # Paper ratio, 1:10 against lambda_corr. This is the term that makes the field
+  # a registration instead of a free reparameterisation, and it is the first knob
+  # to raise if R_flow_max grows without bound.
+  lambda_smooth: 10.0
+
+  # Off, so exp7 differs from exp1 in exactly one respect: the frame L1 is taken
+  # in. Adding a contrastive term at the same time would make a win unattributable.
+  lambda_nce: 0.0

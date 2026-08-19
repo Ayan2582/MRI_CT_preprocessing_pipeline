@@ -1,7 +1,12 @@
 """
 dataset.py
 ──────────
-PairedSliceDataset — the training index over the QC-accepted MRI/CT pairs.
+The training index over the QC-accepted MRI/CT slices.
+
+PairedSliceDataset is the one every experiment up to exp7 uses: one item is one
+QC-accepted pair, both modalities from the same manifest row.
+UnpairedSliceDataset exists only for the CycleGAN baseline (exp8) and is
+described at its own definition.
 
 The preprocessing pipeline deliberately stopped short of sizing the images.
 pipeline_config.py:35 states it outright: "This pipeline does not crop, pad, or
@@ -290,14 +295,146 @@ class PairedSliceDataset(Dataset):
         return item
 
 
+class UnpairedSliceDataset(Dataset):
+    """
+    One item = an MRI from one patient and a CT from a DIFFERENT patient.
+
+    WHY THIS EXISTS AT ALL, GIVEN THE DATA IS PAIRED. CycleGAN is the standard
+    unpaired comparator in the MRI->CT literature, and the question it answers
+    here is "what does the pairing actually buy me?" — how much of exp1's
+    accuracy comes from having 2161 QC-accepted correspondences rather than just
+    two piles of images. It is expected to lose on mae_norm. The size of the gap
+    is the result.
+
+    THE SPLIT IS BY PATIENT, NOT BY ROW. The training subjects are partitioned
+    into two disjoint halves and the MRI is drawn only from the first, the CT
+    only from the second. Shuffling rows within one pool would be easier and is
+    what most repurposed-paired-data CycleGAN setups do, but it leaves the model
+    able to see both modalities of the same patient — so "unpaired" would be a
+    claim the experiment does not support. The cost is that each domain sees
+    about half the slices; that is the honest price of the claim.
+
+    VALIDATION IS NEVER UNPAIRED. build_datasets swaps only the training set.
+    Every metric in evaluation/metrics.py compares a prediction against ITS
+    target, so an unpaired validation set would report numbers that mean nothing
+    while still plotting a perfectly convincing curve.
+
+    IMPLEMENTATION. Two PairedSliceDatasets over the two halves, from which only
+    the wanted modality is kept. That loads one .npy more per item than strictly
+    needed, which is a real but small cost (~300 KB), and buys exact reuse of the
+    ROI handling, padding, crop and mask logic rather than a second copy of it
+    that could drift.
+    """
+
+    def __init__(self, manifest, split_seed=1337, **kwargs):
+        self._kwargs = dict(kwargs, mode="train")
+        self._split_seed = int(split_seed)
+        self._build(manifest)
+
+    def _build(self, manifest):
+        subjects = sorted(manifest["subject_id"].unique())
+        if len(subjects) < 2:
+            raise ValueError(
+                f"UnpairedSliceDataset needs at least 2 training subjects to "
+                f"split into disjoint domains, got {len(subjects)}."
+            )
+
+        # A dedicated RandomState, not the global one: which patients land in
+        # which domain must depend on data.unpaired_split_seed alone, so the
+        # partition is identical across runs, resumes and machines. Drawing from
+        # the global RNG would make it depend on how many augmentation samples
+        # had been taken before the dataset was constructed.
+        order = list(subjects)
+        np.random.RandomState(self._split_seed).shuffle(order)
+        half = len(order) // 2
+        subjects_a, subjects_b = set(order[:half]), set(order[half:])
+
+        self.subjects_a, self.subjects_b = sorted(subjects_a), sorted(subjects_b)
+        self.domain_A = PairedSliceDataset(
+            manifest[manifest["subject_id"].isin(subjects_a)], **self._kwargs)
+        self.domain_B = PairedSliceDataset(
+            manifest[manifest["subject_id"].isin(subjects_b)], **self._kwargs)
+
+        logger.info("dataset[train] UNPAIRED: MRI from %d subjects (%d slices), "
+                    "CT from %d disjoint subjects (%d slices), split_seed=%d",
+                    len(subjects_a), len(self.domain_A),
+                    len(subjects_b), len(self.domain_B), self._split_seed)
+
+    # `df` is a read/write view over both halves so that callers which subsample
+    # a dataset by assigning to .df — scripts/smoke_test.py does — keep working.
+    # Assignment re-derives the partition from the same seed rather than slicing
+    # the existing halves, because an arbitrary subset of rows can easily miss
+    # one domain entirely.
+    @property
+    def df(self):
+        import pandas as pd
+        return pd.concat([self.domain_A.df, self.domain_B.df], ignore_index=True)
+
+    @df.setter
+    def df(self, manifest):
+        self._build(manifest.reset_index(drop=True))
+
+    def __len__(self):
+        # The larger domain defines an epoch; the smaller is drawn from with
+        # replacement. Taking the min instead would silently discard slices from
+        # whichever half happens to be bigger.
+        return max(len(self.domain_A), len(self.domain_B))
+
+    def __getitem__(self, index):
+        a = self.domain_A[index % len(self.domain_A)]
+        b = self.domain_B[np.random.randint(len(self.domain_B))]
+
+        return {
+            "A": a["A"],                 # MRI, patient from domain A
+            "B": b["B"],                 # CT, patient from domain B
+            # Two masks, because the two images are different sizes' worth of
+            # different patients and share no geometry. Everything upstream of
+            # exp8 assumes one shared mask, which is only meaningful for a
+            # co-registered pair.
+            "mask_A": a["mask"],
+            "mask_B": b["mask"],
+            # Kept so that anything reading the paired key still gets something
+            # coherent: it is A's mask, which is the right one for the A-domain
+            # terms.
+            "mask": a["mask"],
+            "hu_min": b["hu_min"],       # the CT window belongs to the CT
+            "hu_max": b["hu_max"],
+            "body_region": b["body_region"],
+            "patient_id": a["patient_id"],
+            "patient_id_B": b["patient_id"],
+            "index": int(index),
+        }
+
+    def subsample_per_region(self, limit):
+        """
+        Keep roughly `limit` slices per domain, spread across body regions.
+
+        Exists for the CPU smoke test. Subsampling each domain separately is what
+        keeps both non-empty — taking `limit` rows from the concatenated frame
+        can land them all on one side of the partition.
+        """
+        for domain in (self.domain_A, self.domain_B):
+            frame = domain.df
+            per_region = max(1, limit // frame["body_region"].nunique())
+            domain.df = (frame.groupby("body_region", sort=True)
+                         .head(per_region).reset_index(drop=True))
+        return self
+
+
 def build_datasets(cfg, manifest, split):
     """
     Construct the train/val/test datasets for a resolved config.
 
-    Returns {split_name: PairedSliceDataset}. Splits with no patients are
-    omitted rather than raising, so a smoke-test manifest with only training
-    patients still works.
+    Returns {split_name: dataset}. Splits with no patients are omitted rather
+    than raising, so a smoke-test manifest with only training patients still
+    works.
+
+    With data.unpaired the TRAIN split becomes an UnpairedSliceDataset and val
+    and test stay paired. That asymmetry is deliberate and is the only way the
+    CycleGAN baseline can be scored against the other experiments at all — see
+    UnpairedSliceDataset's docstring.
     """
+    unpaired = bool(cfg.data.get("unpaired", False))
     datasets = {}
     for name in ("train", "val", "test"):
         # Filter on subject_id, matching how the split was built: PA32 owns two
@@ -307,14 +444,19 @@ def build_datasets(cfg, manifest, split):
         if len(rows) == 0:
             logger.warning("split '%s' has no slices; skipping", name)
             continue
-        datasets[name] = PairedSliceDataset(
-            manifest=rows,
+        common = dict(
             root=cfg.data.root,
-            mode=name,
             crop_size=cfg.data.crop_size,
             pad_multiple=cfg.data.pad_multiple,
             hflip=cfg.data.get_path("augment.hflip", True),
             num_downs=cfg.model.generator.num_downs,
             use_roi=cfg.data.get("use_roi", "none"),
         )
+        if unpaired and name == "train":
+            datasets[name] = UnpairedSliceDataset(
+                manifest=rows,
+                split_seed=cfg.data.get("unpaired_split_seed", 1337),
+                **common)
+        else:
+            datasets[name] = PairedSliceDataset(manifest=rows, mode=name, **common)
     return datasets

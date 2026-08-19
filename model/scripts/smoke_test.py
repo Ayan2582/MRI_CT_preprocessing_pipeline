@@ -91,6 +91,23 @@ STYLEGAN_OVERRIDES = [
 ]
 
 
+# RegGAN carries a third network with its own sizing knobs, so it needs the base
+# shrink plus its own. num_downs=2 on R against a 64px crop bottoms out at 16x16,
+# which is plenty for a field that is low-frequency by construction.
+REGGAN_OVERRIDES = BASE_OVERRIDES + [
+    "model.registration.nrf=8",
+    "model.registration.num_downs=2",
+]
+
+
+# CycleGAN holds four networks, so it shrinks the same way exp0-exp4 do but
+# needs the unconditional D its config already declares, plus a pool small enough
+# to actually cycle within a two-epoch run.
+CYCLEGAN_OVERRIDES = BASE_OVERRIDES + [
+    "train.image_pool_size=8",
+]
+
+
 def _tiny_datasets(cfg, n_train=20, n_val=8):
     """Cut the real data down to a handful of slices, keeping region variety."""
     manifest = load_manifest(cfg.data.manifest)
@@ -99,6 +116,13 @@ def _tiny_datasets(cfg, n_train=20, n_val=8):
 
     for name, limit in (("train", n_train), ("val", n_val)):
         if name not in datasets:
+            continue
+        # UnpairedSliceDataset has to subsample each domain separately: its two
+        # halves hold disjoint patients, and `limit` rows taken from the
+        # concatenation can easily land entirely on one side, leaving the other
+        # empty.
+        if hasattr(datasets[name], "subsample_per_region"):
+            datasets[name].subsample_per_region(limit)
             continue
         df = datasets[name].df
         # Take a few per region so the region-gated metrics are exercised —
@@ -319,6 +343,257 @@ def check_stylegan2(out_root):
     return True
 
 
+def check_reggan(out_root):
+    """
+    RegGAN: structure, and the three ways its correction term fails silently.
+
+    Every assertion here except the structural one guards something that trains
+    happily and reports a falling loss while being wrong. That is the character
+    of this model — the registration field has no ground truth, so nothing
+    downstream can notice when it drifts from "the residual misalignment" into
+    "whatever minimises the loss".
+    """
+    log.info("─" * 70)
+    log.info("CHECK 5  RegGAN")
+
+    from model.losses.builder import LossPlan
+    from model.networks.registration import RegistrationUNet, SpatialTransformer
+
+    # ── 5a. R starts as the identity ─────────────────────────────────────────
+    # networks/registration.py zero-initialises the output head AFTER
+    # init_weights, which would otherwise overwrite it with N(0, 0.02). Lose that
+    # ordering and step 0 warps the target by a field of tens of pixels: the
+    # generator chases a scrambled CT and never recovers, while the loss curve
+    # falls exactly as it would in a healthy run, because R is simultaneously
+    # learning to undo its own noise. There is no other symptom.
+    fresh = RegistrationUNet(in_channels=2, nrf=8, num_downs=2)
+    with torch.no_grad():
+        field = fresh(torch.randn(2, 2, 64, 64))
+    worst = float(field.abs().max())
+    assert worst < 1e-2, (
+        f"R emits a displacement of {worst:.3f} px at initialisation, expected "
+        f"~0. The zero-init of the output head was clobbered — check that it "
+        f"runs AFTER init_weights in RegistrationUNet.__init__.")
+    log.info("PASS  R starts at the identity (max displacement %.2e px)", worst)
+
+    # ── 5b. The warp is exact ────────────────────────────────────────────────
+    # SpatialTransformer converts pixel displacements into grid_sample's
+    # normalised coordinates. Get the align_corners convention or the half-pixel
+    # offset wrong and every warp carries a constant sub-pixel shift, so the
+    # correction loss measures a fixed resampling blur on top of the real
+    # residual and R_flow_px reports a bias that is not in the data.
+    stn = SpatialTransformer()
+    probe = torch.randn(2, 1, 48, 64)
+    identity = stn(probe, torch.zeros(2, 2, 48, 64))
+    shift = float((identity - probe).abs().max())
+    assert shift < 1e-5, (
+        f"warping by a zero field changed the image by {shift:.2e}; the "
+        f"pixel-to-normalised coordinate conversion in SpatialTransformer is off "
+        f"(align_corners / half-pixel offset).")
+
+    # A known integer shift must move the image by exactly that much, in the
+    # direction claimed: flow is (dx, dy) and samples FROM base + flow.
+    flow = torch.zeros(2, 2, 48, 64)
+    flow[:, 0] = 3.0
+    moved = stn(probe, flow)
+    assert torch.allclose(moved[:, :, :, :-3], probe[:, :, :, 3:], atol=1e-5), (
+        "a +3 px dx did not shift the image by 3 px along x; the (x, y) channel "
+        "order or the sampling direction is reversed.")
+    log.info("PASS  warp is exact: zero field is a no-op, +3px dx shifts by 3px")
+
+    # ── 5c. lambda_corr without lambda_smooth is refused ─────────────────────
+    # The degenerate optimum: an unpenalised field can warp almost any prediction
+    # onto almost any target, so L_corr falls to zero while G learns nothing.
+    try:
+        LossPlan(load_config("model/configs/exp7_reggan.yaml",
+                             REGGAN_OVERRIDES + ["loss.lambda_smooth=0"]))
+    except ValueError:
+        log.info("PASS  lambda_corr without lambda_smooth is refused at config time")
+    else:
+        raise AssertionError(
+            "lambda_corr>0 with lambda_smooth=0 should raise: the field would be "
+            "unconstrained and the correction loss trivially minimisable")
+
+    # ── 5d. Structure, and a real training run ───────────────────────────────
+    cfg = load_config("model/configs/exp7_reggan.yaml",
+                      REGGAN_OVERRIDES + ["run.name=smoke_reggan"])
+    _run(cfg, out_root)
+
+    state = torch.load(os.path.join(out_root, "smoke_reggan", "checkpoints", "last.pt"),
+                       map_location="cpu", weights_only=False)["model"]
+    for key in ("netG", "netD", "netR", "optimizer_R"):
+        assert key in state, f"exp7: '{key}' missing from the checkpoint"
+    for key in ("netF", "optimizer_F"):
+        assert key not in state, (
+            f"exp7: '{key}' is in the checkpoint, but lambda_nce is 0 — that code "
+            f"path was built despite being switched off")
+    assert state["loss_plan"]["lambda_l1"] == 0, (
+        "exp7 is supposed to REPLACE L1 with the registered version, not add to it")
+    log.info("PASS  %-24s absent=%-22s nickname=%r", "exp7_reggan",
+             "netF,optimizer_F", state["loss_plan"]["nickname"])
+
+    # The diagnostic exp7 exists to produce must actually reach the metrics file.
+    with open(os.path.join(out_root, "smoke_reggan", "metrics.csv"),
+              encoding="utf-8") as fh:
+        header = fh.readline()
+    for column in ("train/G_corr", "train/G_smooth", "train/R_flow_px"):
+        assert column in header, f"'{column}' never reached metrics.csv"
+    assert "train/G_L1" not in header, (
+        "an unwarped L1 term was logged by a run whose lambda_l1 is 0")
+    log.info("PASS  G_corr/G_smooth/R_flow_px logged to metrics.csv, G_L1 absent")
+
+    # ── 5e. Resume restores R too ────────────────────────────────────────────
+    # netR and optimizer_R are new checkpoint state. If either were dropped, the
+    # run would continue from the identity field with an already-trained
+    # generator — which looks like a mild loss bump and nothing else. Same
+    # construction as CHECK 3; see its docstring for why the interruption uses
+    # stop_after_epoch rather than a shorter n_epochs.
+    cfg_a = load_config("model/configs/exp7_reggan.yaml",
+                        REGGAN_OVERRIDES + ["run.name=smoke_reg_straight"])
+    _, best_straight = _run(cfg_a, out_root, epochs=4)
+
+    cfg_b = load_config("model/configs/exp7_reggan.yaml",
+                        REGGAN_OVERRIDES + ["run.name=smoke_reg_resumed"])
+    _run(cfg_b, out_root, epochs=4, stop_after_epoch=2)
+    cfg_c = load_config("model/configs/exp7_reggan.yaml",
+                        REGGAN_OVERRIDES + ["run.name=smoke_reg_resumed"])
+    _, best_resumed = _run(cfg_c, out_root, resume="auto", epochs=4)
+
+    delta = abs(best_straight - best_resumed)
+    log.info("straight(4)=%.8f  resumed(2+2)=%.8f  delta=%.2e",
+             best_straight, best_resumed, delta)
+    assert delta < 1e-6, (
+        f"RegGAN resume diverged by {delta:.2e}; netR or optimizer_R is not being "
+        f"restored faithfully")
+    log.info("PASS  resumed RegGAN run matches the uninterrupted one")
+
+    return True
+
+
+def check_cyclegan(out_root):
+    """
+    CycleGAN: four networks, an honestly unpaired training set, paired metrics.
+
+    The two assertions that matter most are not about the model at all. 6b checks
+    that no patient contributes both modalities — without which "unpaired" is a
+    claim the experiment does not support — and 6c checks that validation stayed
+    paired, without which the reported numbers mean nothing while still plotting
+    a convincing curve.
+    """
+    log.info("─" * 70)
+    log.info("CHECK 6  CycleGAN")
+
+    from model.data.dataset import PairedSliceDataset, UnpairedSliceDataset
+    from model.training.image_pool import ImagePool
+
+    # ── 6a. The image pool returns history, and detaches it ──────────────────
+    # A stored tensor that kept its graph would pin the generator's activations
+    # from several steps ago alive — a leak that ends in an OOM tens of epochs
+    # in, far from the change that caused it.
+    pool = ImagePool(4)
+    tracked = torch.randn(3, 1, 8, 8, requires_grad=True) * 2.0
+    out = pool.query(tracked)
+    assert out.shape == tracked.shape, f"pool changed the batch shape: {out.shape}"
+    assert not out.requires_grad, (
+        "ImagePool returned a tensor that still carries a graph; stored fakes "
+        "must be detached or the generator's history is never freed")
+    for _ in range(20):
+        pool.query(torch.randn(3, 1, 8, 8))
+    assert len(pool) == 4, f"pool grew past pool_size: {len(pool)}"
+    log.info("PASS  image pool: detached, bounded at pool_size")
+
+    # ── 6b. The unpaired split is genuinely unpaired ─────────────────────────
+    cfg = load_config("model/configs/exp8_cyclegan.yaml",
+                      CYCLEGAN_OVERRIDES + ["run.name=smoke_cyclegan"])
+    manifest = load_manifest(cfg.data.manifest)
+    datasets = build_datasets(cfg, manifest, load_split(cfg.data.splits))
+
+    train = datasets["train"]
+    assert isinstance(train, UnpairedSliceDataset), (
+        f"data.unpaired is true but the train set is a {type(train).__name__}")
+    assert set(train.subjects_a).isdisjoint(train.subjects_b), (
+        "the two domains share a subject, so the model can see both modalities "
+        "of one patient and this is not an unpaired experiment")
+
+    clashes = sum(1 for i in range(120)
+                  if train[i]["patient_id"] == train[i]["patient_id_B"])
+    assert clashes == 0, (
+        f"{clashes} of 120 items paired an MRI and a CT from the same patient")
+    log.info("PASS  unpaired: %d + %d disjoint subjects, 0/120 same-patient items",
+             len(train.subjects_a), len(train.subjects_b))
+
+    # ── 6c. Validation stayed paired ─────────────────────────────────────────
+    # Every metric in evaluation/metrics.py compares a prediction against ITS
+    # target. An unpaired val set would score a synthetic CT of one patient
+    # against a real CT of another and report the result as mae_norm.
+    for split in ("val", "test"):
+        assert isinstance(datasets[split], PairedSliceDataset), (
+            f"the {split} set is unpaired; its metrics would be meaningless")
+    log.info("PASS  val and test stay paired")
+
+    # ── 6d. A conditional discriminator is refused ───────────────────────────
+    # It would judge whether a CT corresponds to a given MRI — but they are
+    # different patients here and no correspondence is claimed.
+    try:
+        from model.training.builder import build_model
+        build_model(load_config("model/configs/exp8_cyclegan.yaml",
+                                CYCLEGAN_OVERRIDES +
+                                ["model.discriminator.conditional=true"]),
+                    torch.device("cpu"))
+    except ValueError:
+        log.info("PASS  a conditional discriminator is refused at construction")
+    else:
+        raise AssertionError(
+            "model.discriminator.conditional=true should raise for CycleGAN: "
+            "the two modalities in a batch come from different patients")
+
+    # ── 6e. Structure, and a real training run ───────────────────────────────
+    trainer, best = _run(cfg, out_root)
+
+    state = torch.load(os.path.join(out_root, "smoke_cyclegan", "checkpoints", "last.pt"),
+                       map_location="cpu", weights_only=False)["model"]
+    for key in ("netG_A2B", "netG_B2A", "netD_A", "netD_B",
+                "optimizer_G", "optimizer_D"):
+        assert key in state, f"exp8: '{key}' missing from the checkpoint"
+    for key in ("netG", "netD", "netF", "netR", "optimizer_F", "optimizer_R"):
+        assert key not in state, (
+            f"exp8: '{key}' is in the checkpoint — a pix2pix-family key leaked "
+            f"into a CycleGAN run")
+    log.info("PASS  %-24s 4 networks, 2 optimizers, nickname=%r",
+             "exp8_cyclegan", state["loss_plan"]["nickname"])
+
+    with open(os.path.join(out_root, "smoke_cyclegan", "metrics.csv"),
+              encoding="utf-8") as fh:
+        header = fh.readline()
+    for column in ("train/G_cycle_A", "train/G_cycle_B", "val/mae_norm"):
+        assert column in header, f"'{column}' never reached metrics.csv"
+    assert "train/G_L1" not in header, (
+        "an L1-against-target term was logged by a run that has no paired target")
+    log.info("PASS  cycle terms logged, paired val/mae_norm still computed (%.5f)",
+             best)
+
+    # ── 6f. Resume restores all four networks ────────────────────────────────
+    # NOT the bit-exact comparison CHECK 3 and CHECK 5 make: the image pools are
+    # deliberately not checkpointed (see image_pool.py), so a resumed run sees a
+    # different sample of past fakes and legitimately diverges. What must hold is
+    # that every weight comes back exactly.
+    cfg_resume = load_config("model/configs/exp8_cyclegan.yaml",
+                             CYCLEGAN_OVERRIDES + ["run.name=smoke_cyclegan"])
+    reloaded, _ = _run(cfg_resume, out_root, resume="auto", epochs=2,
+                       stop_after_epoch=0)
+    for name in ("netG_A2B", "netG_B2A", "netD_A", "netD_B"):
+        before = state[name]
+        after = getattr(reloaded.model, name).state_dict()
+        assert set(before) == set(after), f"{name}: parameter names changed on load"
+        for key, tensor in before.items():
+            assert torch.equal(tensor, after[key].cpu()), (
+                f"{name}.{key} differs after a resume; the checkpoint is not "
+                f"being restored faithfully")
+    log.info("PASS  all four networks restored bit-exactly on resume")
+
+    return True
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="CPU smoke test for the model wiring")
     parser.add_argument("--quick", action="store_true", help="wiring check only")
@@ -336,7 +611,8 @@ def main(argv=None):
     try:
         checks = [check_wiring]
         if not args.quick:
-            checks += [check_modularity, check_resume, check_stylegan2]
+            checks += [check_modularity, check_resume, check_stylegan2,
+                       check_reggan, check_cyclegan]
         for check in checks:
             check(out_root)
 

@@ -211,6 +211,53 @@ class Pix2PixNCEModel(nn.Module):
         """Whether the adversarial term contributes this epoch."""
         return self.plan.use_gan and epoch >= self.warmup_epochs
 
+    def train_mode(self):
+        """
+        Put every trained network into training mode.
+
+        The trainer used to reach in for .netG and .netD by name. That works for
+        exactly one model class; CycleGAN has four networks and none of them are
+        called netG. Asking the model instead keeps the epoch loop indifferent to
+        what it is driving — the same reason optimize_parameters exists.
+        """
+        self.netG.train()
+        if self.netD is not None:
+            self.netD.train()
+        if self.netF is not None:
+            self.netF.train()
+
+    # ── Extension points for subclasses ──────────────────────────────────────
+    # RegGAN adds a correction term and a fourth optimizer. It does that through
+    # these two methods rather than by overriding backward_G, because the
+    # scaler / autocast / path-length interleaving below is fiddly enough that a
+    # second copy of it would eventually drift from this one — and the failure
+    # mode of a mis-scaled backward is silently wrong gradients, not a crash.
+
+    def extra_G_terms(self, stats):
+        """
+        Additional generator loss, evaluated inside the autocast context.
+
+        Returns a scalar added to loss_G, and may write diagnostics into `stats`.
+        The base model has no extra terms, so this is a zero that never enters
+        the graph — harmless, because LossPlan guarantees at least one live term.
+
+        NOTE the grad_clip below clips netG's parameters only, which is the
+        behaviour every existing config was tuned against. A subclass adding a
+        network whose gradients also need clipping has to do it itself.
+        """
+        return torch.zeros((), device=self.device)
+
+    def g_step_optimizers(self):
+        """
+        Every optimizer stepped by the generator's backward pass.
+
+        optimizer_F may still be None the first time this is called on a fresh
+        run — the MLP heads are built lazily on the first NCE forward — which is
+        why it is filtered here rather than assumed. See the module docstring.
+        """
+        return [opt for opt in (self.optimizer_G, self.optimizer_F)
+                if opt is not None]
+
     # ── Loss terms ───────────────────────────────────────────────────────────
 
     def compute_nce(self, source, target):
@@ -356,9 +403,13 @@ class Pix2PixNCEModel(nn.Module):
                     loss_G = loss_G + self.plan.lambda_nce * g_idt
                     stats["G_NCE_idt"] = g_idt.detach()
 
-        self.optimizer_G.zero_grad(set_to_none=True)
-        if self.optimizer_F is not None:
-            self.optimizer_F.zero_grad(set_to_none=True)
+            loss_G = loss_G + self.extra_G_terms(stats)
+
+        # Collected AFTER the autocast block, never before: optimizer_F comes
+        # into existence during the NCE forward pass above.
+        optimizers = self.g_step_optimizers()
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
 
         scaler.scale(loss_G).backward()
 
@@ -366,9 +417,8 @@ class Pix2PixNCEModel(nn.Module):
             scaler.unscale_(self.optimizer_G)
             nn.utils.clip_grad_norm_(self.netG.parameters(), self.grad_clip)
 
-        scaler.step(self.optimizer_G)
-        if self.optimizer_F is not None:
-            scaler.step(self.optimizer_F)
+        for opt in optimizers:
+            scaler.step(opt)
 
         stats["G_total"] = loss_G.detach()
 

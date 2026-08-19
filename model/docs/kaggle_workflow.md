@@ -146,13 +146,26 @@ Then in the right-hand panel:
 
 | setting | value | why |
 |---|---|---|
-| Accelerator | **GPU P100** | faster than T4 here; the code is single-GPU, so T4 x2 leaves one card idle |
+| Accelerator | **GPU T4 x2** | **not P100** — see below. The code is single-GPU, so the second T4 sits idle; that is fine |
 | Internet | **On** | needed for `git clone` (not needed with option B) |
-| Persistence | Files only | keeps `/kaggle/working` between runs |
+| Persistence | Files only | keeps `/kaggle/working` between runs — but see the stale-clone warning below |
 | Input | **+ Add Input** → your dataset | mounts it under `/kaggle/input/` |
 
+> **Do not pick P100.** It is the faster card on paper, and this table used to
+> recommend it. Recent PyTorch builds dropped Pascal (sm_60), so a P100 session
+> fails with `no kernel image is available for execution on the device` — not at
+> startup, but at the first CUDA op, after you have already spent the setup time.
+> `docs/notebook_walkthrough.md` records the same finding.
+
+> **Persistence + the clone guard is a trap.** Cell 2 clones only
+> `if not os.path.isdir(REPO_DIR)`. With persistence on, `/kaggle/working` survives
+> between sessions, so an existing clone is *never* refreshed and code you pushed
+> since then never arrives — the run trains happily with the old code. After any
+> push, either delete `/kaggle/working/MRI_CT_preprocessing_pipeline` or run
+> `git -C /kaggle/working/MRI_CT_preprocessing_pipeline pull` before training.
+
 Quota is **30 GPU-hours/week**, reset Saturday. One 200-epoch experiment is
-roughly 3-5 hours on a P100, so budget ~2 sessions per experiment.
+roughly 3-5 hours, so budget ~2 sessions per experiment.
 
 ---
 
@@ -254,7 +267,13 @@ runs/exp3_nce_heavy/
 ```
 
 Checkpoints are ~650 MB each (G + D + F + three optimizer states + EMA). Only
-`best.pt` and `last.pt` are kept.
+`best.pt` and `last.pt` are kept. `exp7_reggan` adds R and its optimizer, but R
+is small by design (nrf=32, ~2 M params) so the total moves by well under 10%.
+`exp8_cyclegan` carries **four** networks and is roughly **1.2 GB** — budget for
+that when a session's output quota matters. Its image pools are deliberately not
+saved, so a resumed exp8 is not bit-identical to an uninterrupted one; every
+weight is restored exactly, but D sees a different sample of past fakes for the
+first epoch back.
 
 For inference you only need `state['model']['netG']`, or the EMA weights at
 `state['model']['ema']['ema']`, which is what you should actually deploy.
@@ -267,9 +286,16 @@ Each is a separate Kaggle run with its own `run.name`:
 
 ```python
 CONFIG = 'model/configs/exp1_pix2pix.yaml'     # baseline first
-CONFIG = 'model/configs/exp3_nce_heavy.yaml'   # then the hypothesis
+CONFIG = 'model/configs/exp7_reggan.yaml'      # then measure the misalignment
+CONFIG = 'model/configs/exp3_nce_heavy.yaml'   # then the hypothesis it informs
 CONFIG = 'model/configs/exp0_l1_only.yaml'     # the floor (fast, no D)
+CONFIG = 'model/configs/exp8_cyclegan.yaml'    # last: what was the pairing worth?
 ```
+
+Run **exp7 before exp3**, not after. exp3 reweights its objective as a hedge
+against a residual misalignment nobody has measured; exp7 measures it. If
+`R_flow_px` converges to ~0 there is nothing for exp3 to hedge against and you
+can skip it, which is a whole Kaggle session saved.
 
 Then locally:
 
@@ -279,7 +305,8 @@ python model/evaluation/evaluate.py --compare model/runs/exp* --split val
 
 Budget roughly: ~210 iterations/epoch at batch 8; 200 epochs is a few hours on a
 P100, so 1–2 sessions per experiment. `exp0` is noticeably faster — no
-discriminator is built at all.
+discriminator is built at all. `exp8` is the slowest: four networks, four
+generator passes per step, and its own batch size of 4, so budget 2–3 sessions.
 
 ---
 

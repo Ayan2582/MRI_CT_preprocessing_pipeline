@@ -57,17 +57,22 @@ python model/scripts/train.py --config exp2_paper.yaml --set loss.lambda_nce=0
 
 Run in order. Each answers exactly one question; each is one config file.
 
-| # | config | λ_GAN | λ_L1 | λ_NCE | architecture | question |
-|---|---|---|---|---|---|---|
-| 0 | `exp0_l1_only` | 0 | 100 | 0 | U-Net + PatchGAN | is the GAN earning its keep at all? |
-| 1 | `exp1_pix2pix` | 1 | 100 | 0 | U-Net + PatchGAN | what does the standard recipe give? |
-| 2 | `exp2_paper` | 1 | 100 | 1 | U-Net + PatchGAN | the target loss, textbook weights |
-| 3 | `exp3_nce_heavy` | 1 | 50 | 2 | U-Net + PatchGAN | lean on NCE — open question |
-| 4 | `exp4_nce_max` | 1 | 10 | 5 | U-Net + PatchGAN | where does hallucination start? |
-| 5 | `exp5_stylegan2_vanilla` | 1 | **0** | **0** | StyleGAN2 | what does StyleGAN2's *own* loss give? |
-| 6 | `exp6_stylegan2_fitted` | 1 | 100 | 1 | StyleGAN2 | does the architecture beat the U-Net? |
+| # | config | λ_GAN | λ_L1 | λ_NCE | λ_corr | architecture | question |
+|---|---|---|---|---|---|---|---|
+| 0 | `exp0_l1_only` | 0 | 100 | 0 | 0 | U-Net + PatchGAN | is the GAN earning its keep at all? |
+| 1 | `exp1_pix2pix` | 1 | 100 | 0 | 0 | U-Net + PatchGAN | what does the standard recipe give? |
+| 2 | `exp2_paper` | 1 | 100 | 1 | 0 | U-Net + PatchGAN | the target loss, textbook weights |
+| 3 | `exp3_nce_heavy` | 1 | 50 | 2 | 0 | U-Net + PatchGAN | lean on NCE — open question |
+| 4 | `exp4_nce_max` | 1 | 10 | 5 | 0 | U-Net + PatchGAN | where does hallucination start? |
+| 5 | `exp5_stylegan2_vanilla` | 1 | **0** | **0** | 0 | StyleGAN2 | what does StyleGAN2's *own* loss give? |
+| 6 | `exp6_stylegan2_fitted` | 1 | 100 | 1 | 0 | StyleGAN2 | does the architecture beat the U-Net? |
+| 7 | `exp7_reggan` | 1 | **0** | 0 | **100** | U-Net + PatchGAN + R | how much residual misalignment is there, and does correcting it help? |
+| 8 | `exp8_cyclegan` | 1 | **0** | 0 | 0 | 2×U-Net + 2×PatchGAN | what is the pairing worth? (λ_cycle 10, λ_idt 0.5) |
 
-**0–4 vary the objective on one fixed architecture. 5 and 6 do the opposite.**
+**0–4 vary the objective on one fixed architecture. 5 and 6 change the
+architecture instead. 7 changes neither — it changes the *frame the loss is
+taken in*. 8 changes the *data*: it is the only experiment here trained without
+correspondences at all.**
 
 `exp0` is the floor and `exp5` is the ceiling — the same experiment run from
 opposite ends. exp0 is a regression with no adversary; exp5 is StyleGAN2's
@@ -84,6 +89,39 @@ texture and stability, exp6 for accuracy.
 
 **exp6 is the one to compare against exp2.** Identical λs, identical data, split
 and seed — so the only thing that moved is the architecture.
+
+**exp7 is the one to compare against exp1**, and it is the only experiment here
+that produces a measurement rather than just a score. Section 1 below explains
+that manual QC corrected translation on these pairs but could not correct
+in-plane rotation, and that the leftover is unmeasured — which is the entire
+basis for exp3's reweighting. exp7 predicts that leftover with a small
+registration network R, takes L1 *after* applying it, and logs the field's mean
+magnitude every epoch as `R_flow_px`, in millimetres.
+
+So exp7 settles exp3's premise either way:
+
+| `R_flow_px` converges to | what it means |
+|---|---|
+| ~0 mm | the pairs really are aligned; exp3 was hedging against nothing, and exp2 stays the target |
+| a few mm | the residual is real, now quantified, and exp7 should beat exp1 on `mae_norm` for a stateable reason |
+
+The failure to watch for is `R_flow_max` growing without bound while `G_corr`
+keeps falling: that is R absorbing the *generator's* errors as if they were
+misalignment, and the fix is a larger `loss.lambda_smooth`.
+
+**exp8 is the only experiment that measures the QC effort itself.** Every other
+run is handed 2161 hand-checked correspondences — 129 pairs rejected, 738 slices
+nudged individually, artifacts erased on 560. exp8 throws that away: the 33
+training subjects are split into two disjoint halves, MRI is drawn only from one
+and CT only from the other, so no patient ever contributes both modalities. The
+gap between exp8 and exp1 is what the pairing bought.
+
+**exp8 is expected to lose on `mae_norm`. Report the size of the gap, not the
+winner.** Validation and test stay paired — swapping only the training set is
+what makes exp8 comparable to anything at all. Read the sample panels as well as
+the metrics: cycle consistency is satisfiable by a generator that produces a
+plausible CT of the *wrong* anatomy, and in the metrics that failure is
+indistinguishable from ordinary blur.
 
 ---
 
@@ -141,21 +179,36 @@ correct source.
 
 ```
 model/
-├── configs/          base.yaml + the seven experiments (deltas only)
-├── data/             manifest, subject-level split, PairedSliceDataset
+├── configs/          base.yaml + the nine experiments (deltas only)
+├── data/             manifest, subject-level split, PairedSliceDataset,
+│                     UnpairedSliceDataset (exp8 only)
 ├── networks/         builder (type dispatch), U-Net with tappable encoder,
-│                     PatchGAN, StyleGAN2 G+D, PatchSampleF, tiled inference
-├── losses/           GAN variants, PatchNCE, the loss plan
-├── training/         composite model, trainer, EMA, DiffAugment
+│                     PatchGAN, StyleGAN2 G+D, PatchSampleF, tiled inference,
+│                     RegistrationUNet + SpatialTransformer
+├── losses/           GAN variants, PatchNCE, flow smoothness, the loss plan
+├── training/         builder (model dispatch), composite model, RegGAN,
+│                     CycleGAN, trainer, EMA, DiffAugment, image pool
 ├── evaluation/       region-aware metrics, run comparison
 ├── scripts/          make_split, train, smoke_test, package_for_kaggle
 ├── notebooks/        kaggle_train.ipynb
 └── docs/             the four guides above
 ```
 
-`networks/builder.py` is the only module that knows more than one architecture
-exists; `unet.py` and `patchgan.py` still know only about themselves. A third
-architecture is one import and one branch there.
+There are two dispatch points and nothing else knows a choice exists.
+`networks/builder.py` maps `model.generator.type` / `model.discriminator.type` to
+an architecture — `unet.py` and `patchgan.py` still know only about themselves —
+and `training/builder.py` maps `model.name` to a training model, so the epoch
+loop never names a network. A new architecture is one import and one branch in
+the first; a new model is one import and one branch in the second.
+
+`RegGANModel` subclasses `Pix2PixNCEModel` rather than reimplementing it, adding
+its correction term through two extension points (`extra_G_terms`,
+`g_step_optimizers`). `backward_G` is deliberately not overridden: its
+scaler/autocast/path-length interleaving is delicate, and a second copy of it
+would drift. `CycleGANModel` does *not* subclass it — it replaces the step
+rather than extending it — and instead implements the same trainer-facing
+surface, which `training/builder.py` documents. That surface is why the epoch
+loop never names a network and can drive one model or four.
 
 A StyleGAN2 generator emits **one fixed resolution**, but 45% of validation slices
 (103 of 230 — every abdomen and every spine slice) pad to 512. `networks/tiling.py`
