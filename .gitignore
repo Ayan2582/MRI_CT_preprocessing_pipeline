@@ -8,6 +8,10 @@
 __pycache__/
 *.pyc
 *.json
+*.csv
+*.jsonl
+*.yaml
+split_audit.py
 
 # Training runs: checkpoints, logs, sample panels. Large and regenerable.
 /model/runs

@@ -370,3 +370,4 @@ generator passes per step, and its own batch size of 4, so budget 2–3 sessions
 - `gan_evaluation_guide.md` — how to tell whether it is working
 - `loss_function_guide.md` — the three terms and their λs
 - `training_strategies.md` — objective variants and the six stabilisers
+- `learn/` — how the models you are launching are actually built: start at `learn/README.md`

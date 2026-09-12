@@ -244,3 +244,12 @@ loss:
 > **On `temperature`:** it is not a free knob. It scales the logits, so it
 > changes the loss magnitude, so it changes the effective weight of `lambda_nce`.
 > Change one or the other, not both, or you will not know which caused what.
+
+---
+
+## See also
+
+- `learn/02_gan_from_zero.md`, `learn/07_patchnce.md` — what these terms compute, in code
+- `gan_evaluation_guide.md` — how to tell whether a λ change helped
+- `training_strategies.md` — the objective variants and the stabilisers
+- `training_log_reference.md` — every number the trainer prints

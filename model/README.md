@@ -42,6 +42,14 @@ python model/scripts/train.py --config exp2_paper.yaml --set loss.lambda_nce=0
 
 ## Documentation
 
+**Learning how these models work and how to build them:**
+
+| document | read it for |
+|---|---|
+| **[docs/learn/](docs/learn/README.md)** | **thirteen documents that build every model here from the ground up** — concept, a minimal version you can run, then the repo file walked line by line |
+
+**Running, judging and operating a training run:**
+
 | document | read it for |
 |---|---|
 | **[gan_evaluation_guide.md](docs/gan_evaluation_guide.md)** | **how to tell whether your GAN is improving** — start here |
@@ -191,7 +199,7 @@ model/
 ├── evaluation/       region-aware metrics, run comparison
 ├── scripts/          make_split, train, smoke_test, package_for_kaggle
 ├── notebooks/        kaggle_train.ipynb
-└── docs/             the four guides above
+└── docs/             the six guides above, plus learn/ (13 build-it-yourself documents)
 ```
 
 There are two dispatch points and nothing else knows a choice exists.

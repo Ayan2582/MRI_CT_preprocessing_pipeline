@@ -295,3 +295,4 @@ multiplying by 1.0 the whole time it warns. It would only matter if
 - `gan_evaluation_guide.md` — how to decide whether a run is better than another
 - `loss_function_guide.md` — the three loss terms and their λs
 - `training_strategies.md` — the objective variants and the six stabilisers
+- `learn/` — the code that produces these numbers: start at `learn/README.md`

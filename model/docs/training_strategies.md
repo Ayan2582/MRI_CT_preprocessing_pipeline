@@ -382,3 +382,4 @@ dataloader workers misbehave.
 - `gan_evaluation_guide.md` — how to tell whether any of this is working
 - `loss_function_guide.md` — the three loss terms and their λs
 - `kaggle_workflow.md` — packaging, training, resuming
+- `learn/08_stabilisers_in_code.md` — the code behind every stabiliser argued for here

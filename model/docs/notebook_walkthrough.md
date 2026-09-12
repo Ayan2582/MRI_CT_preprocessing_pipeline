@@ -319,3 +319,4 @@ because the new run directory has no `last.pt`.
 - `loss_function_guide.md` — the three loss terms and their λs
 - `training_strategies.md` — objective variants and the six stabilisers
 - `kaggle_workflow.md` — package, upload, train, resume
+- `learn/` — what the code in those cells does, built up from scratch: start at `learn/README.md`

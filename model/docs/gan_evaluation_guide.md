@@ -369,3 +369,4 @@ Both "fixed" choices matter:
 - `loss_function_guide.md` — what each term does and what each λ changes
 - `training_strategies.md` — the objective variants and all six stabilisers
 - `kaggle_workflow.md` — packaging, training, resuming
+- `learn/` — how the models are built, from convolution up: start at `learn/README.md`
